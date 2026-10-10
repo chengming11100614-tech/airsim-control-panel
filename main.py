@@ -280,6 +280,11 @@ class GCSApp:
         self._minimum_cruise_clearance = float("inf")
         self._cruise_elapsed = 0.0
         self.recorder = None
+        self._panel_log_lock = threading.Lock()
+        self._panel_log_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "logs",
+            "panel_%s.log" % time.strftime("%Y%m%d"),
+        )
 
         self._build_style()
         self._build_ui()
@@ -644,8 +649,17 @@ class GCSApp:
     # =======================================================================
 
     def _log(self, msg, tag="info"):
-        stamp = time.strftime("%H:%M:%S")
-        self.ui_q.put(("log", ("[%s] %s" % (stamp, msg), tag)))
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = "[%s] %s" % (stamp, msg)
+        # 界面日志同步落盘，飞行告警在关闭窗口后仍可从 logs/panel_日期.log 排查。
+        try:
+            os.makedirs(os.path.dirname(self._panel_log_path), exist_ok=True)
+            with self._panel_log_lock:
+                with open(self._panel_log_path, "a", encoding="utf-8") as log_file:
+                    log_file.write(line + "\n")
+        except OSError:
+            pass
+        self.ui_q.put(("log", (line, tag)))
 
     def _set_mode(self, m):
         """切换模式。
@@ -1466,7 +1480,7 @@ class GCSApp:
                      planned_start, revision, alt)
 
     def _job_cruise(self, trajectory, limits, obstacles, planned_start, revision, alt):
-        """以 20 Hz 预测控制执行已验证轨迹；失效或遥测异常就停机悬停。"""
+        """以 20 Hz 跟踪已验证轨迹；可恢复偏差写日志并向前回归。"""
         if revision != self.map_revision or trajectory is not self.trajectory:
             self._log("航线在启动前已失效，请重新规划。", "err")
             return
@@ -1497,6 +1511,8 @@ class GCSApp:
                       % (trajectory.estimated_time, limits.max_speed), "hi")
             elapsed = 0.0
             previous_tick = time.monotonic()
+            last_warning_key = ""
+            last_warning_time = 0.0
             while not self.stop_evt.is_set():
                 cycle_start = time.monotonic()
                 if self.pause_evt.is_set():
@@ -1537,9 +1553,29 @@ class GCSApp:
                     (telemetry["vx"], telemetry["vy"], telemetry["vz"]),
                     elapsed,
                 )
+                if result.warning:
+                    if "航点" in result.warning:
+                        warning_key = "航点经过偏差"
+                    elif "高度偏差" in result.warning:
+                        warning_key = "高度跟踪偏差"
+                    elif "横向偏差" in result.warning or "规划轨迹" in result.warning:
+                        warning_key = "横向跟踪偏差"
+                    else:
+                        warning_key = result.warning.split(" ", 1)[0]
+                    if (warning_key != last_warning_key
+                            or time.monotonic() - last_warning_time >= 3.0):
+                        self._log(
+                            "自动巡航告警：%s；保持前进并尝试回归航线。"
+                            % result.warning,
+                            "warn",
+                        )
+                        last_warning_key = warning_key
+                        last_warning_time = time.monotonic()
+                else:
+                    last_warning_key = ""
                 if result.fault:
                     self.client.hoverAsync().join()
-                    self._log("自动巡航安全停止：%s。" % result.fault, "err")
+                    self._log("自动巡航硬安全保护：%s；已悬停。" % result.fault, "err")
                     break
                 self.cruise_index = min(
                     len(trajectory.waypoint_distances) - 1,

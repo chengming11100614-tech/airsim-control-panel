@@ -215,7 +215,7 @@ class ControllerTests(unittest.TestCase):
         self.assertLess(minimum_clearance, limits.safety_clearance)
         self.assertGreaterEqual(minimum_clearance, 0.10)
 
-    def test_controller_hovers_on_obstacle_clearance_or_waypoint_miss(self):
+    def test_controller_hard_stops_at_physical_edge(self):
         limits = _limits(speed=5.0)
         route = self.straight_trajectory()
         blocked = PredictivePathController(
@@ -226,7 +226,10 @@ class ControllerTests(unittest.TestCase):
         # 0.8 m 是规划时的绕障余量；进入这段余量仍可继续沿路线飞行。
         buffered = PredictivePathController(
             route, limits, [CircleObstacle(5, 1.79, 1.0)]
-        ).check_state((5, 0, -5))
+        )
+        buffered._progress_distance = 5.0
+        buffered._previous_position = (5.0, 0.0, -5.0)
+        buffered = buffered.check_state((5, 0, -5))
         self.assertEqual(buffered[2], "")
         self.assertAlmostEqual(buffered[1], 0.0)
         edge_clearance = math.hypot(5 - 5, 0 - 1.79) - 1.0
@@ -235,13 +238,55 @@ class ControllerTests(unittest.TestCase):
         # 接近手绘障碍物实体边缘时，仍保留小的硬保护间距。
         near_edge = PredictivePathController(
             route, limits, [CircleObstacle(5, 1.05, 1.0)]
-        ).check_state((5, 0, -5))
+        )
+        near_edge._progress_distance = 5.0
+        near_edge._previous_position = (5.0, 0.0, -5.0)
+        near_edge = near_edge.check_state((5, 0, -5))
         self.assertIn("障碍物", near_edge[2])
 
-        skipped = PredictivePathController(
+    def test_off_route_tracking_keeps_forward_progress_and_does_not_follow_wall_clock(self):
+        limits = _limits(speed=2.0)
+        controller = PredictivePathController(self.straight_trajectory(), limits)
+
+        # 虽然任务时钟已到末段，实际位置仍在前半段；参考必须跟实测进度走。
+        result = controller.step((2.0, 0.8, -5.0), (0.0, 0.0), elapsed=8.0)
+
+        self.assertEqual(result.fault, "")
+        self.assertGreater(result.vx, 0.0)
+        self.assertLess(result.vy, 0.0)
+        self.assertIn("横向偏差", result.warning)
+        self.assertLess(result.progress, 3.0)
+
+    def test_missed_waypoint_advances_order_without_reverse_command(self):
+        limits = _limits(speed=2.0)
+        controller = PredictivePathController(
             self.straight_trajectory((5.0, 10.0)), limits
-        ).step((10, 0, -5), (0, 0, 0), 0.0)
-        self.assertIn("航点", skipped.fault)
+        )
+        controller._progress_distance = 4.8
+        controller._previous_position = (4.8, 0.4, -5.0)
+
+        result = controller.step((5.2, 0.4, -5.0), (0.1, 0.0), elapsed=3.0)
+
+        self.assertEqual(result.fault, "")
+        self.assertIn("航点", result.warning)
+        self.assertEqual(controller._next_waypoint, 1)
+        self.assertGreater(result.vx, 0.0)
+
+    def test_vertical_segment_uses_three_dimensional_progress(self):
+        limits = _limits(speed=2.0)
+        samples = tuple(TrajectorySample(
+            time=float(index), distance=float(index), x=0.0, y=0.0,
+            z=-5.0 - index, vx=0.0, vy=0.0, vz=1.0 if index else 0.0,
+            ax=0.0, ay=0.0, az=0.0, curvature=0.0,
+        ) for index in range(3))
+        trajectory = PlannedTrajectory(samples, (2.0,), 2.0, 2.0, 0.0, "vertical")
+        controller = PredictivePathController(trajectory, limits)
+
+        progress, deviation, fault = controller.check_state((0.0, 0.0, -5.5))
+
+        self.assertEqual(fault, "")
+        self.assertAlmostEqual(progress, 0.5)
+        self.assertAlmostEqual(deviation, 0.0)
 
     def test_predictive_controller_follows_a_certified_obstacle_curve(self):
         limits = _limits(speed=3.0)
