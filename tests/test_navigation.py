@@ -29,6 +29,7 @@ from navigation.planner import (
     _lift_leg,
     plan_ordered_route,
 )
+from navigation.telemetry import deviation_to_path
 from navigation.time_parameterization import time_parameterize
 
 
@@ -139,6 +140,47 @@ class RoutePlanningTests(unittest.TestCase):
         self.assertLessEqual(prediction.waypoint_errors[-1], 0.6)
         self.assertLess(math.dist(prediction.samples[-1].position,
                                   waypoints[-1].position), 0.6)
+
+    def test_race_route_prediction_matches_measured_outer_turn(self):
+        # 这是 route_20261010_214901.csv 的同一任务：实飞在 (21.4, -4.0)
+        # 障碍附近自然外绕，预测也应保留这一条可飞路线，而不是为压低拐点误差
+        # 改选另一侧、与实际飞行相差数米的候选。
+        start = (2.9046869278, -23.7249641418, -5.0)
+        waypoints = [
+            Waypoint(21.8, -19.1, -5),
+            Waypoint(24.7, -9.1, -5),
+            Waypoint(15.3, -3.7, -5),
+            Waypoint(3.0, -11.6, -5),
+            Waypoint(-3.8, 3.8, -5),
+        ]
+        obstacles = [
+            CircleObstacle(-0.7, -2.6, 3.0),
+            CircleObstacle(30.3, -17.7, 3.0),
+            CircleObstacle(21.4, -4.0, 3.0),
+        ]
+
+        trajectory = plan_ordered_route(start, waypoints, obstacles, KinematicLimits())
+        prediction = trajectory.execution_prediction
+        predicted_path = [sample.position for sample in prediction.samples]
+        predicted_distances = [sample.distance for sample in prediction.samples]
+        measured_turn_position = (26.06, -2.74)
+        measured_turn_error = deviation_to_path(
+            measured_turn_position[0], measured_turn_position[1],
+            predicted_path, predicted_distances,
+        )["dist"]
+
+        self.assertTrue(prediction.safe)
+        self.assertGreater(max(prediction.waypoint_errors), 0.6)
+        self.assertLessEqual(prediction.waypoint_errors[0], 1.25)
+        self.assertLessEqual(prediction.waypoint_errors[3], 1.25)
+        self.assertLessEqual(prediction.waypoint_errors[2], 0.6)
+        self.assertLessEqual(prediction.waypoint_errors[4], 0.6)
+        self.assertAlmostEqual(trajectory.length, 84.7, delta=0.2)
+        self.assertLess(measured_turn_error, 0.2)
+        self.assertGreaterEqual(
+            trajectory.minimum_clearance,
+            KinematicLimits().safety_clearance + KinematicLimits().tracking_reserve,
+        )
 
     def test_height_and_hold_are_included_and_speed_changes_estimated_time(self):
         waypoints = [Waypoint(5, 0, -10, hold=0.7), Waypoint(10, 5, -5)]

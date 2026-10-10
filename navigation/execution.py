@@ -15,8 +15,10 @@ from .models import (
 )
 
 
-# 面板的到点接收半径；预测中远离该半径的路线不能称为已可行。
-PREDICTED_WAYPOINT_TOLERANCE = 0.6
+# 竞速转弯允许飞机按实际惯性外绕航点；历史实飞最大经过误差约 1.18 m。
+# 直线航点仍用 0.6 m；顺序完整性与障碍净空在所有位置都是硬约束。
+PREDICTED_STRAIGHT_WAYPOINT_TOLERANCE = 0.6
+PREDICTED_TURN_WAYPOINT_TOLERANCE = 1.25
 
 
 def predict_execution(
@@ -123,11 +125,21 @@ def predict_execution(
 
     samples = _to_samples(states)
     waypoint_errors = tuple(errors)
+    waypoint_tolerances = tuple(
+        PREDICTED_TURN_WAYPOINT_TOLERANCE
+        if abs(min(
+            trajectory.samples,
+            key=lambda sample: abs(sample.distance - waypoint_distance),
+        ).curvature) > 0.02
+        else PREDICTED_STRAIGHT_WAYPOINT_TOLERANCE
+        for waypoint_distance in trajectory.waypoint_distances
+    )
     required_clearance = limits.safety_clearance + limits.tracking_reserve
     safe = (
         complete
         and all(math.isfinite(error) for error in waypoint_errors)
-        and max(waypoint_errors, default=0.0) <= PREDICTED_WAYPOINT_TOLERANCE
+        and all(error <= tolerance
+                for error, tolerance in zip(waypoint_errors, waypoint_tolerances))
         and minimum_clearance >= required_clearance - 1e-6
     )
     return ExecutionPrediction(
