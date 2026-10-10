@@ -104,7 +104,8 @@ def analyze_calibration(
     braking = min(5.0, max(0.5, median(braking_values))) if braking_values else 1.0
 
     responses = [trial.response_time for trial in qualified if math.isfinite(trial.response_time)]
-    response_time = median(responses) if responses else 0.35
+    command_delay = 0.10  # 20 Hz 指令周期折算为最多两个采样周期。
+    response_time = max(0.05, median(responses) - command_delay) if responses else 0.25
     worst_error = max((trial.cross_track_p95 for trial in qualified), default=0.0)
     profile = CalibrationProfile(
         calibrated=calibrated,
@@ -113,7 +114,7 @@ def analyze_calibration(
         braking=braking,
         lateral_acceleration=max(0.5, lateral_acceleration),
         response_time=max(0.05, response_time),
-        command_delay=0.10,
+        command_delay=command_delay,
         cross_track_p95=worst_error,
         tested_speeds=tuple(trial.speed for trial in trials),
     )
