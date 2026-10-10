@@ -1,24 +1,19 @@
-"""用线性化轮廓预测控制器跟踪已规划轨迹。"""
+"""用前视目标跟踪已规划曲线，并保留曲线上的竞速速度计划。"""
 
-from dataclasses import dataclass, replace
 from bisect import bisect_right
+from dataclasses import dataclass
 import math
 
-import numpy as np
-import osqp
-from scipy import sparse
-
-from .models import KinematicLimits, PlannedTrajectory
+from .models import KinematicLimits, PlannedTrajectory, TrajectorySample
 
 
-# 规划用的膨胀半径包含较大的跟踪余量；巡航时允许飞机进入这段余量，
-# 只在接近手绘障碍物的实际边界时触发硬停止。单位为米，量到飞机中心。
+# 只有接近手绘障碍的实体边界才触发硬悬停。规划曲线另有安全间距和跟踪余量。
 HARD_OBSTACLE_CLEARANCE = 0.10
 
 
 @dataclass(frozen=True)
 class ControlResult:
-    """单次速度指令；warning 只记录，fault 仅用于真实硬安全边界。"""
+    """单拍 AirSim 速度指令及其跟踪诊断。"""
 
     vx: float
     vy: float
@@ -33,15 +28,18 @@ class ControlResult:
     reference_z: float = 0.0
     reference_distance: float = 0.0
     sample_period: float = 0.0
-    solver_status: str = ""
+    controller_mode: str = ""
     waypoint_passages: tuple = ()
+    reference_curvature: float = 0.0
+    planned_speed: float = 0.0
 
 
-class PredictivePathController:
-    """跟踪一条固定轨迹，不在飞行中创建或修改航线。
+class CarrotPathController:
+    """沿固定规划曲线前视跟踪，不在飞行中改线或向后追点。
 
-    状态为 XY 位置与速度，控制量为 AirSim 的 XY 速度命令。预测模型将
-    飞机响应近似为一阶滞后；代价同时惩罚参考线偏差、偏离计划速度和命令变化。
+    目标点始终取自原规划曲线的前方。控制器直接朝前视点给出速度方向，
+    因而飞机过弯时可以自然走弦线、向弯内收；它不会把这种合理偏差硬拉回
+    曲线中心。速度大小仍受规划器输出的逐点速度曲线和实测加速度约束控制。
     """
 
     def __init__(
@@ -50,11 +48,7 @@ class PredictivePathController:
         limits: KinematicLimits,
         obstacles=(),
         dt: float = 0.05,
-        horizon: int = 10,
         max_cross_track: float = 1.0,
-        position_weight: float = 24.0,
-        speed_weight: float = 0.20,
-        smooth_weight: float = 3.0,
     ):
         if len(trajectory.samples) < 2:
             raise ValueError("巡航轨迹至少需要两个采样点")
@@ -62,11 +56,7 @@ class PredictivePathController:
         self.limits = limits
         self.obstacles = tuple(obstacles)
         self.dt = dt
-        self.horizon = horizon
         self.max_cross_track = max_cross_track
-        self.position_weight = position_weight
-        self.speed_weight = speed_weight
-        self.smooth_weight = smooth_weight
         self._times = [sample.time for sample in trajectory.samples]
         self._distances = [sample.distance for sample in trajectory.samples]
         self._progress_distance = 0.0
@@ -74,25 +64,17 @@ class PredictivePathController:
         self._next_waypoint = 0
         self._last_warning = ""
         self._last_waypoint_passages = ()
-        self._previous_command = np.zeros(2, dtype=float)
-        self._solver, self._control_matrix = self._build_solver()
-        self._solver_period = dt
+        self._previous_command = (0.0, 0.0)
 
     def update_period(self, observed_period: float):
-        """用相邻遥测真实间隔更新预测步长；忽略明显异常的长停顿。"""
-        if not math.isfinite(observed_period) or observed_period < 0.03 or observed_period > 0.15:
+        """平滑采用真实遥测周期，忽略明显异常的停顿。"""
+        if not math.isfinite(observed_period) or not 0.03 <= observed_period <= 0.15:
             return
         observed_period = min(0.10, max(0.035, observed_period))
-        updated = 0.8 * self.dt + 0.2 * observed_period
-        if abs(updated - self._solver_period) < 0.004:
-            self.dt = updated
-            return
-        self.dt = updated
-        self._solver, self._control_matrix = self._build_solver()
-        self._solver_period = self.dt
+        self.dt = 0.8 * self.dt + 0.2 * observed_period
 
     def check_state(self, position):
-        """检查偏航和实际障碍边界；规划膨胀余量不是碰撞边界。"""
+        """报告偏航；只有逼近实体障碍边缘才触发安全悬停。"""
         self._last_waypoint_passages = ()
         x, y, z = (float(value) for value in position)
         clearance = min(
@@ -108,98 +90,132 @@ class PredictivePathController:
 
         previous_progress = self._progress_distance
         distance, deviation, expected_z = self._project_progress(x, y, z)
-        self._progress_distance = max(self._progress_distance, distance)
+        self._progress_distance = max(previous_progress, distance)
         warnings = []
         if deviation > 0.25:
-            warnings.append("横向偏差 %.2f m，正在向前回归航线" % deviation)
+            warnings.append("横向偏差 %.2f m；前视跟踪继续向前" % deviation)
         if deviation > self.max_cross_track:
             warnings.append(
-                "偏离规划轨迹 %.2f m，超过 %.2f m 提醒阈值"
+                "偏离规划曲线 %.2f m，超过 %.2f m 提醒阈值"
                 % (deviation, self.max_cross_track)
             )
         if abs(z - expected_z) > 0.25:
             warnings.append("高度偏差 %.2f m，继续沿线修正" % abs(z - expected_z))
-        waypoint_fault = self._check_waypoint_passage(
+        waypoint_warning = self._check_waypoint_passage(
             (x, y, z), previous_progress, self._progress_distance
         )
-        if waypoint_fault:
-            warnings.append(waypoint_fault)
+        if waypoint_warning:
+            warnings.append(waypoint_warning)
         self._previous_position = (x, y, z)
         self._last_warning = "；".join(warnings)
         return self._progress_distance, deviation, ""
 
     def step(self, position, velocity, elapsed: float) -> ControlResult:
-        """读取一次遥测并返回下一拍速度命令。"""
+        """按当前进度选前视点，再输出受速度计划与加速度限制的指令。"""
         x, y, z = (float(value) for value in position)
         vx, vy = float(velocity[0]), float(velocity[1])
         progress, deviation, fault = self.check_state((x, y, z))
         if fault:
-            return ControlResult(0.0, 0.0, z, progress, deviation,
-                                 fault=fault, sample_period=self.dt,
-                                 solver_status="safety-stop")
-
-        references, holding = self._references_from_progress(elapsed, deviation)
-        q = self._objective_vector(x, y, vx, vy, references)
-        lower, upper = self._dynamic_command_bounds()
-        self._solver.update(q=q, l=lower, u=upper)
-        solution = self._solver.solve()
-        if solution.info.status_val not in (1, 2) or solution.x is None:
-            command = (np.zeros(2, dtype=float) if holding else
-                       self._forward_recovery_command((x, y), deviation))
-            command = self._limit_command_change(command)
-            self._previous_command = command
-            reference = references[0]
             return ControlResult(
-                float(command[0]), float(command[1]), reference.z,
-                progress, deviation,
-                warning="预测控制器本拍未能及时求解，使用沿线前进控制继续巡航",
-                reference_x=reference.x,
-                reference_y=reference.y,
-                reference_z=reference.z,
-                reference_distance=reference.distance,
-                sample_period=self.dt,
-                solver_status=solution.info.status,
-                waypoint_passages=self._last_waypoint_passages,
+                0.0, 0.0, z, progress, deviation,
+                fault=fault, sample_period=self.dt, controller_mode="safety-stop",
             )
 
-        command = np.asarray(solution.x[:2], dtype=float)
-        magnitude = float(np.linalg.norm(command))
-        if magnitude > self.limits.max_speed:
-            command *= self.limits.max_speed / magnitude
-        command = self._limit_command_change(command)
-        if not holding and deviation > 0.25:
-            command = self._enforce_forward_recovery(command, progress)
-        self._previous_command = command
-
         final = self.trajectory.samples[-1]
-        finished = (
-            elapsed >= self.trajectory.estimated_time
-            and math.hypot(x - final.x, y - final.y) <= 0.25
-            and abs(float(position[2]) - final.z) <= 0.25
-            and math.hypot(vx, vy) <= 0.35
+        if self._next_waypoint >= len(self.trajectory.waypoint_distances):
+            return self._terminal_result(x, y, z, vx, vy, progress, deviation)
+
+        timed_sample = self._sample_at_time(elapsed)
+        if self._is_holding_at(timed_sample, elapsed, progress):
+            command = self._slew_command((0.0, 0.0))
+            return self._result(
+                command, timed_sample.z, progress, deviation, timed_sample,
+                mode="waypoint-hold",
+            )
+
+        # 前视距离随实际速度增长，弯中指向弦线上的目标点，形成自然内切。
+        actual_speed = math.hypot(vx, vy)
+        path_sample = self._sample_at_distance(progress)
+        lookahead = self._lookahead_distance(
+            actual_speed, deviation, abs(path_sample.curvature)
         )
-        # 终点允许在 0.25 m 内停车，投影可能尚未越过最后一个弧长采样。
-        # 记录最终实测位置，避免完成报告把最后一航点标成漏点。
-        if finished and self._next_waypoint == len(self.trajectory.waypoint_distances) - 1:
-            target = self._sample_at_distance(self.trajectory.waypoint_distances[-1])
-            final_error = math.hypot(x - target.x, y - target.y)
-            self._last_waypoint_passages += ((self._next_waypoint, final_error),)
-            self._next_waypoint += 1
-        reference = references[0]
+        target_distance = min(self._distances[-1], progress + lookahead)
+        target = self._sample_at_distance(target_distance)
+        tangent = self._tangent_at_distance(progress)
+        direction = self._forward_carrot_direction(
+            (x, y), (target.x, target.y), tangent, lookahead
+        )
+
+        # 速度曲线已在弯前按曲率提前减速；控制器只读取当前进度，不因偏差降速，
+        # 避免偏航时减速、转向、再反向修正形成周期性摆动。
+        scheduled_speed = self._scheduled_speed(progress)
+        if self._next_waypoint == len(self.trajectory.waypoint_distances) - 1:
+            scheduled_speed = min(scheduled_speed, self._final_braking_cap(progress))
+        desired = (direction[0] * scheduled_speed,
+                   direction[1] * scheduled_speed)
+        command = self._slew_command(desired)
+
+        reference = path_sample
+        # 高度目标用前方短距离样点，平顺接入爬升段，不把整段 lookahead 当作升降跳变。
+        z_sample = self._sample_at_distance(
+            min(self._distances[-1], progress + min(0.5, lookahead))
+        )
+        finished = self._finish_if_at_last_waypoint(x, y, z, vx, vy)
+        if finished:
+            command = self._slew_command((0.0, 0.0))
         return ControlResult(
-            float(command[0]), float(command[1]), reference.z,
-            progress, deviation, finished=finished, warning=self._last_warning,
-            reference_x=reference.x,
-            reference_y=reference.y,
-            reference_z=reference.z,
-            reference_distance=reference.distance,
+            command[0], command[1], z_sample.z, progress, deviation,
+            finished=finished,
+            warning=self._last_warning,
+            reference_x=target.x,
+            reference_y=target.y,
+            reference_z=target.z,
+            reference_distance=target.distance,
             sample_period=self.dt,
-            solver_status=solution.info.status,
+            controller_mode="carrot-forward",
             waypoint_passages=self._last_waypoint_passages,
+            reference_curvature=reference.curvature,
+            planned_speed=scheduled_speed,
         )
+
+    def _terminal_result(self, x, y, z, vx, vy, progress, deviation):
+        """按顺序点都已报告后制动；末点偏差写日志，不倒飞找点。"""
+        final = self.trajectory.samples[-1]
+        command = self._slew_command((0.0, 0.0))
+        endpoint_error = math.sqrt((x - final.x) ** 2 + (y - final.y) ** 2
+                                    + (z - final.z) ** 2)
+        warning = self._last_warning
+        if endpoint_error > 0.25:
+            warning = "；".join(filter(None, (warning, "末点误差 %.2f m；不倒飞追点" % endpoint_error)))
+        return ControlResult(
+            command[0], command[1], final.z, progress, deviation,
+            finished=math.hypot(vx, vy) <= 0.35,
+            warning=warning,
+            reference_x=final.x,
+            reference_y=final.y,
+            reference_z=final.z,
+            reference_distance=final.distance,
+            sample_period=self.dt,
+            controller_mode="terminal-braking",
+            waypoint_passages=self._last_waypoint_passages,
+            reference_curvature=final.curvature,
+        )
+
+    def _finish_if_at_last_waypoint(self, x, y, z, vx, vy):
+        """在末点容差内停车时补记经过误差，预计时间不阻挡提前完成。"""
+        if self._next_waypoint != len(self.trajectory.waypoint_distances) - 1:
+            return False
+        target_distance = self.trajectory.waypoint_distances[-1]
+        target = self._sample_at_distance(target_distance)
+        error = math.hypot(x - target.x, y - target.y)
+        if error <= 0.25 and abs(z - target.z) <= 0.25 and math.hypot(vx, vy) <= 0.35:
+            self._last_waypoint_passages += ((self._next_waypoint, error),)
+            self._next_waypoint += 1
+            return True
+        return False
 
     def _check_waypoint_passage(self, position, previous_progress, progress):
-        """按顺序核对航点；漏点只告警并向前推进，不反向追赶。"""
+        """按输入顺序记录航点；漏点只告警并继续前飞。"""
         warnings = []
         passages = []
         while self._next_waypoint < len(self.trajectory.waypoint_distances):
@@ -216,12 +232,11 @@ class PredictivePathController:
                 fraction = 1.0
             crossing = tuple(a + fraction * (b - a)
                              for a, b in zip(previous, position))
-            # 验收指标按水平航点误差统计；高度由独立的 Z 轴跟踪约束处理。
             error = math.hypot(crossing[0] - target[0], crossing[1] - target[1])
             if error > 0.25:
                 warnings.append(
-                    "第 %d 个航点经过误差 %.2f m；不回头，继续前飞并回归后续航线"
-                    % (self._next_waypoint + 1, error)
+                    "第 %d 个航点经过误差 %.2f m；继续前飞，不回头" %
+                    (self._next_waypoint + 1, error)
                 )
             passages.append((self._next_waypoint, error))
             self._next_waypoint += 1
@@ -229,7 +244,7 @@ class PredictivePathController:
         return "；".join(warnings)
 
     def _project_progress(self, x, y, z):
-        """仅在当前弧长附近向前搜索，避免自交路线跳到较远的未来分支。"""
+        """在当前弧长附近单调投影，避免自交路线跳到远端分支。"""
         samples = self.trajectory.samples
         distances = self._distances
         first = max(0, bisect_right(distances, self._progress_distance) - 2)
@@ -237,25 +252,30 @@ class PredictivePathController:
             observed_step = 0.0
         else:
             observed_step = math.dist(self._previous_position, (x, y, z))
-        # 按相邻遥测实际移动距离限制前向搜索，防止自交航线突然跳到远端分支。
-        max_advance = max(1.0, observed_step + max(0.35, self.limits.max_speed * self.dt * 2.0))
-        last = min(len(samples) - 1,
-                   bisect_right(distances, self._progress_distance + max_advance) + 2)
+        max_advance = max(
+            1.0, observed_step + max(0.35, self.limits.max_speed * self.dt * 2.0)
+        )
+        last = min(
+            len(samples) - 1,
+            bisect_right(distances, self._progress_distance + max_advance) + 2,
+        )
         best_distance = self._progress_distance
         best_score = float("inf")
         best_error = float("inf")
         closest_z = samples[first].z
         for index in range(first, last):
             a, b = samples[index], samples[index + 1]
-            dx, dy, dz = b.x - a.x, b.y - a.y, b.z - a.z
-            length_sq = dx * dx + dy * dy + dz * dz
-            if length_sq <= 1e-12:
+            delta = (b.x - a.x, b.y - a.y, b.z - a.z)
+            length_squared = sum(value * value for value in delta)
+            if length_squared <= 1e-12:
                 fraction = 0.0
             else:
+                offset = (x - a.x, y - a.y, z - a.z)
                 fraction = max(0.0, min(1.0,
-                    ((x - a.x) * dx + (y - a.y) * dy + (z - a.z) * dz) / length_sq))
-            px, py = a.x + fraction * dx, a.y + fraction * dy
-            pz = a.z + fraction * dz
+                    sum(a * b for a, b in zip(offset, delta)) / length_squared))
+            px, py, pz = (a.x + fraction * delta[0],
+                          a.y + fraction * delta[1],
+                          a.z + fraction * delta[2])
             error = math.hypot(x - px, y - py)
             score = error * error + (z - pz) ** 2
             if score < best_score:
@@ -266,150 +286,20 @@ class PredictivePathController:
         return best_distance, best_error, closest_z
 
     def _sample_at_distance(self, distance):
-        """按弧长定位规划采样，重复距离对应同一悬停点。"""
+        """按弧长读取规划点；航点悬停的重复弧长仍映射到同一位置。"""
         samples = self.trajectory.samples
-        distances = self._distances
-        if distance <= distances[0]:
+        if distance <= self._distances[0]:
             return samples[0]
-        if distance >= distances[-1]:
+        if distance >= self._distances[-1]:
             return samples[-1]
-        right = bisect_right(distances, distance)
+        right = bisect_right(self._distances, distance)
         first, second = samples[right - 1], samples[right]
         span = second.distance - first.distance
         fraction = (distance - first.distance) / span if span > 1e-12 else 0.0
         return _blend(first, second, fraction)
 
-    def _references_from_progress(self, elapsed, deviation):
-        """以实测弧长推进 MPC 参考，飞机落后时参考点不会按墙上时钟跑远。"""
-        timed = self._sample_at_time(elapsed)
-        progress = self._progress_distance
-        holding = self._is_holding_at(timed, elapsed, progress)
-        if holding:
-            return ([self._sample_at_time(elapsed + (index + 1) * self.dt)
-                     for index in range(self.horizon)], True)
-
-        # 偏差越大越保守，给飞机留出向前贴回曲线的时间。
-        recovery_scale = max(0.45, 1.0 - 0.55 * max(0.0, deviation - 0.15))
-        reference_distance = progress
-        references = []
-        total_distance = self._distances[-1]
-        for _ in range(self.horizon):
-            sample = self._sample_at_distance(reference_distance)
-            next_sample = self._sample_at_distance(
-                min(total_distance, reference_distance + max(0.1, self.limits.max_speed * self.dt))
-            )
-            scheduled_speed = math.sqrt(sample.vx ** 2 + sample.vy ** 2 + sample.vz ** 2)
-            # 到达停车航点后，从后续速度曲线取启动速度，避免零速采样卡住进度。
-            next_speed = math.sqrt(
-                next_sample.vx ** 2 + next_sample.vy ** 2 + next_sample.vz ** 2
-            )
-            scheduled_speed = max(scheduled_speed, 0.5 * next_speed)
-            scheduled_speed *= recovery_scale
-            scheduled_speed = min(
-                scheduled_speed,
-                self._waypoint_approach_speed_cap(reference_distance),
-            )
-            reference_distance = min(total_distance, reference_distance + scheduled_speed * self.dt)
-            sample = self._sample_at_distance(reference_distance)
-            references.append(replace(
-                sample,
-                vx=sample.vx * recovery_scale,
-                vy=sample.vy * recovery_scale,
-                vz=sample.vz * recovery_scale,
-            ))
-        return references, False
-
-    def _waypoint_approach_speed_cap(self, progress):
-        """根据实测制动能力提前减速，为航点位置修正留出空间。"""
-        if self._next_waypoint >= len(self.trajectory.waypoint_distances):
-            return self.limits.max_speed
-        remaining = self.trajectory.waypoint_distances[self._next_waypoint] - progress
-        if remaining <= 0.0:
-            return self.limits.max_speed
-        delay = self.limits.response_time + self.limits.command_delay
-        braking = self.limits.max_braking
-        usable_distance = max(0.0, remaining - 0.10)
-        delayed = braking * delay
-        cap = math.sqrt(delayed * delayed + 2.0 * braking * usable_distance) - delayed
-        # 保持小幅正向速度通过航点，不在容差边缘悬停或倒飞。
-        return min(self.limits.max_speed, max(0.20, cap))
-
-    def _is_holding_at(self, timed_sample, elapsed, progress):
-        """只有任务确实处于航点悬停窗口时才继续按时间参考保持静止。"""
-        if math.sqrt(timed_sample.vx ** 2 + timed_sample.vy ** 2 + timed_sample.vz ** 2) > 0.05:
-            return False
-        if abs(timed_sample.distance - progress) > 0.15:
-            return False
-        left = bisect_right(self._distances, timed_sample.distance - 1e-5)
-        right = bisect_right(self._distances, timed_sample.distance + 1e-5)
-        if right - left < 2:
-            return False
-        first_time = self._times[left]
-        last_time = self._times[right - 1]
-        return first_time - 1e-6 <= elapsed <= last_time + 1e-6
-
-    def _tangent_at_distance(self, distance):
-        """返回航线前进切向；停车点使用其后续线段作为前进方向。"""
-        sample = self._sample_at_distance(distance)
-        speed = math.hypot(sample.vx, sample.vy)
-        if speed > 1e-4:
-            return np.asarray((sample.vx / speed, sample.vy / speed), dtype=float)
-        samples = self.trajectory.samples
-        index = min(len(samples) - 1, max(0, bisect_right(self._distances, distance) - 1))
-        for offset in range(1, len(samples)):
-            if index + offset < len(samples):
-                first, second = samples[index + offset - 1], samples[index + offset]
-                direction = np.asarray((second.x - first.x, second.y - first.y), dtype=float)
-                length = float(np.linalg.norm(direction))
-                if length > 1e-8:
-                    return direction / length
-        return np.asarray((1.0, 0.0), dtype=float)
-
-    def _enforce_forward_recovery(self, command, progress):
-        """偏航恢复时确保仍沿当前曲线正向飞行，不倒着追刚刚错过的位置。"""
-        if progress >= self._distances[-1] - 0.15:
-            return command
-        tangent = self._tangent_at_distance(progress)
-        forward_speed = float(np.dot(command, tangent))
-        minimum_forward = min(
-            self.limits.max_speed,
-            0.45,
-            max(0.2, self.limits.max_speed * 0.15),
-        )
-        lateral = command - forward_speed * tangent
-        forward_speed = min(self.limits.max_speed, max(forward_speed, minimum_forward))
-        lateral_cap = math.sqrt(max(0.0, self.limits.max_speed ** 2 - forward_speed ** 2))
-        lateral_magnitude = float(np.linalg.norm(lateral))
-        if lateral_magnitude > lateral_cap > 0.0:
-            lateral *= lateral_cap / lateral_magnitude
-        elif lateral_cap <= 0.0:
-            lateral[:] = 0.0
-        return forward_speed * tangent + lateral
-
-    def _forward_recovery_command(self, position, deviation):
-        """MPC 偶发超时时，用切向前进加横向回归作为单拍替代指令。"""
-        progress = self._progress_distance
-        tangent = self._tangent_at_distance(progress)
-        sample = self._sample_at_distance(progress)
-        speed = math.hypot(sample.vx, sample.vy)
-        if speed <= 1e-4:
-            ahead = self._sample_at_distance(min(self._distances[-1], progress + 0.25))
-            speed = math.hypot(ahead.vx, ahead.vy)
-        if speed <= 1e-4:
-            return np.zeros(2, dtype=float)
-        speed = min(
-            self.limits.max_speed,
-            max(0.0, speed * max(0.45, 1.0 - deviation * 0.4)),
-        )
-        if progress >= self._distances[-1] - 0.15:
-            return np.zeros(2, dtype=float)
-        speed = max(min(0.25, self.limits.max_speed), speed)
-        target = self._sample_at_distance(min(self._distances[-1], progress + max(0.35, speed * 0.35)))
-        correction = np.asarray((target.x - position[0], target.y - position[1]), dtype=float)
-        command = speed * tangent + 1.2 * correction
-        return self._enforce_forward_recovery(command, progress)
-
     def _sample_at_time(self, when):
+        """读取速度计划上的时间点，仅用于识别明确的航点悬停窗口。"""
         samples = self.trajectory.samples
         if when <= samples[0].time:
             return samples[0]
@@ -421,148 +311,141 @@ class PredictivePathController:
         fraction = (when - first.time) / span if span > 1e-12 else 0.0
         return _blend(first, second, fraction)
 
-    def _build_solver(self):
-        """生成固定 Hessian 与速度多边形约束；每拍只更新参考项 q。"""
-        horizon = self.horizon
-        variables = horizon * 2
-        response = max(0.05, self.limits.response_time + self.limits.command_delay)
-        alpha = math.exp(-self.dt / response)
-        prediction = np.zeros((horizon * 2, variables), dtype=float)
-        free_motion = np.zeros((horizon * 2, 2), dtype=float)
-        for step in range(1, horizon + 1):
-            row = (step - 1) * 2
-            free_motion[row:row + 2, :] = (
-                self.dt * alpha * (1.0 - alpha ** step) / (1.0 - alpha)
-            ) * np.eye(2)
-            for command_index in range(step):
-                coefficient = self.dt * (1.0 - alpha ** (step - command_index))
-                col = command_index * 2
-                prediction[row:row + 2, col:col + 2] = coefficient * np.eye(2)
+    def _scheduled_speed(self, progress):
+        """读取规划器的平面速度；只在零速采样处探看很短的前方距离以起步。"""
+        sample = self._sample_at_distance(progress)
+        speed = math.hypot(sample.vx, sample.vy)
+        if speed > 0.12 or progress >= self._distances[-1] - 1e-5:
+            return min(self.limits.max_speed, speed)
+        probe_distance = min(self._distances[-1], progress + 0.25)
+        probe = self._sample_at_distance(probe_distance)
+        probe_speed = math.hypot(probe.vx, probe.vy)
+        # 探测只用于从静止开始和越过无悬停的短暂停车点，不越过局部速度上限。
+        return min(self.limits.max_speed, speed + 0.30 * probe_speed)
 
-        position_weight = self.position_weight
-        speed_weight = self.speed_weight
-        smooth_weight = self.smooth_weight
-        hessian = 2.0 * position_weight * prediction.T @ prediction
-        hessian += 2.0 * speed_weight * np.eye(variables)
-        for step in range(horizon):
-            for axis in range(2):
-                row = np.zeros(variables)
-                row[step * 2 + axis] = 1.0
-                if step:
-                    row[(step - 1) * 2 + axis] = -1.0
-                hessian += 2.0 * smooth_weight * np.outer(row, row)
+    @staticmethod
+    def _lookahead_distance(actual_speed, deviation, curvature):
+        """直线缩短前视以快速收敛，弯道增加前视以顺着弦线自然内切。"""
+        straight = (1.0 + 0.15 * actual_speed) / (1.0 + 0.30 * deviation)
+        straight = max(0.75, min(2.1, straight))
+        curved = min(3.5, max(1.5, 0.9 + 0.42 * actual_speed))
+        # 平滑混合直线和弯道设置，避免曲率刚过阈值时前视距离跳变。
+        curve_weight = max(0.0, min(1.0, (curvature - 0.01) / 0.025))
+        return straight + curve_weight * (curved - straight)
 
-        constraint_rows = []
-        angles = [index * math.pi / 4.0 for index in range(8)]
-        normals = [(math.cos(angle), math.sin(angle)) for angle in angles]
-        for step in range(horizon):
-            for normal in normals:
-                row = np.zeros(variables)
-                row[step * 2] = normal[0]
-                row[step * 2 + 1] = normal[1]
-                constraint_rows.append(row)
-        velocity_constraint_count = len(constraint_rows)
-        for step in range(horizon):
-            for normal in normals:
-                row = np.zeros(variables)
-                row[step * 2] = normal[0]
-                row[step * 2 + 1] = normal[1]
-                if step:
-                    row[(step - 1) * 2] = -normal[0]
-                    row[(step - 1) * 2 + 1] = -normal[1]
-                constraint_rows.append(row)
-        constraint = np.asarray(constraint_rows)
-        cap = self.limits.max_speed * math.cos(math.pi / 8.0)
-        lower = np.full(constraint.shape[0], -np.inf)
-        upper = np.full(constraint.shape[0], cap)
-        lower[velocity_constraint_count:] = -self.limits.max_braking * self.dt
-        upper[velocity_constraint_count:] = self.limits.max_acceleration * self.dt
-
-        solver = osqp.OSQP()
-        solver.setup(
-            P=sparse.csc_matrix((hessian + hessian.T) * 0.5),
-            q=np.zeros(variables),
-            A=sparse.csc_matrix(constraint),
-            l=lower,
-            u=upper,
-            verbose=False,
-            polishing=False,
-            warm_starting=True,
-            adaptive_rho=False,
-            max_iter=60,
-            eps_abs=0.015,
-            eps_rel=0.015,
-            time_limit=0.035,
+    def _final_braking_cap(self, progress):
+        """把响应延迟计入末点制动，防止速度曲线误差导致明显冲过终点。"""
+        target_distance = self.trajectory.waypoint_distances[-1]
+        remaining = max(0.0, target_distance - progress - 0.10)
+        delay = self.limits.response_time + self.limits.command_delay
+        delayed_distance = self.limits.max_braking * delay
+        return max(
+            0.0,
+            math.sqrt(delayed_distance ** 2
+                      + 2.0 * self.limits.max_braking * remaining)
+            - delayed_distance,
         )
-        return solver, (prediction, free_motion, position_weight, speed_weight,
-                        smooth_weight, alpha, velocity_constraint_count, normals)
 
-    def _dynamic_command_bounds(self):
-        """按测得的加减速能力限制预测窗内相邻速度指令的变化。"""
-        velocity_count, normals = self._control_matrix[-2:]
-        row_count = velocity_count + self.horizon * len(normals)
-        lower = np.full(row_count, -np.inf)
-        upper = np.full(
-            row_count,
-            self.limits.max_speed * math.cos(math.pi / 8.0),
-        )
-        for step in range(self.horizon):
-            for index, normal in enumerate(normals):
-                row = velocity_count + step * len(normals) + index
-                if step == 0:
-                    previous = float(np.dot(normal, self._previous_command))
-                    lower[row] = previous - self.limits.max_braking * self.dt
-                    upper[row] = previous + self.limits.max_acceleration * self.dt
-                else:
-                    lower[row] = -self.limits.max_braking * self.dt
-                    upper[row] = self.limits.max_acceleration * self.dt
-        return lower, upper
+    def _tangent_at_distance(self, distance):
+        """取曲线切向；零速停车点使用其前方的第一个非零线段。"""
+        sample = self._sample_at_distance(distance)
+        speed = math.hypot(sample.vx, sample.vy)
+        if speed > 1e-4:
+            return sample.vx / speed, sample.vy / speed
+        index = min(len(self.trajectory.samples) - 1,
+                    max(0, bisect_right(self._distances, distance) - 1))
+        for offset in range(1, len(self.trajectory.samples)):
+            if index + offset < len(self.trajectory.samples):
+                first = self.trajectory.samples[index + offset - 1]
+                second = self.trajectory.samples[index + offset]
+                dx, dy = second.x - first.x, second.y - first.y
+                length = math.hypot(dx, dy)
+                if length > 1e-8:
+                    return dx / length, dy / length
+        return 1.0, 0.0
 
-    def _limit_command_change(self, command):
-        """给求解失败后的替代指令也加上相同的加减速保护。"""
-        command = np.asarray(command, dtype=float)
-        delta = command - self._previous_command
-        magnitude = float(np.linalg.norm(delta))
-        rate = (self.limits.max_acceleration
-                if magnitude == 0.0 or np.linalg.norm(command) >= np.linalg.norm(self._previous_command)
-                else self.limits.max_braking)
-        limit = rate * self.dt
-        if magnitude > limit > 0.0:
-            delta *= limit / magnitude
-        return self._previous_command + delta
+    @staticmethod
+    def _forward_carrot_direction(position, target, tangent, lookahead):
+        """朝前视点走弦线；目标落到侧后方时也保留横向回归分量。"""
+        dx, dy = target[0] - position[0], target[1] - position[1]
+        forward = dx * tangent[0] + dy * tangent[1]
+        lateral = dx * -tangent[1] + dy * tangent[0]
+        # 偏差较大时，前视点可能投影到当前切向后方。丢掉横向分量会让飞机
+        # 继续平行于航线飞，无法收敛；给它一个小的正向分量，同时向前视点靠拢。
+        forward = max(forward, max(0.15, 0.20 * lookahead))
 
-    def _objective_vector(self, x, y, vx, vy, references):
-        prediction, free_motion, position_weight, speed_weight, smooth_weight, _ = self._control_matrix[:6]
-        variables = self.horizon * 2
-        reference_positions = np.empty(self.horizon * 2, dtype=float)
-        reference_velocities = np.empty(variables, dtype=float)
-        for index, sample in enumerate(references):
-            reference_positions[index * 2:index * 2 + 2] = (sample.x, sample.y)
-            reference_velocities[index * 2:index * 2 + 2] = (sample.vx, sample.vy)
-        current_position = np.tile(np.asarray((x, y)), self.horizon)
-        current_velocity = np.tile(np.asarray((vx, vy)), self.horizon)
-        affine = current_position + free_motion @ np.asarray((vx, vy))
-        q = 2.0 * position_weight * prediction.T @ (affine - reference_positions)
-        q -= 2.0 * speed_weight * reference_velocities
+        # 限制从航向的最大夹角，避免极端偏差时横飞或朝反方向修线。
+        max_lateral = forward * math.tan(math.radians(65.0))
+        lateral = max(-max_lateral, min(max_lateral, lateral))
+        vx = forward * tangent[0] - lateral * tangent[1]
+        vy = forward * tangent[1] + lateral * tangent[0]
+        length = math.hypot(vx, vy)
+        if length <= 1e-8:
+            return tangent
+        return vx / length, vy / length
 
+    def _slew_command(self, desired):
+        """只限制速度大小变化；方向直接跟随前视目标，避免弯后拖着横向指令。"""
         previous = self._previous_command
-        q[:2] -= 2.0 * smooth_weight * previous
-        return q
+        previous_speed = math.hypot(*previous)
+        target_speed = math.hypot(*desired)
+        if target_speed > 1e-8:
+            direction = (desired[0] / target_speed, desired[1] / target_speed)
+        elif previous_speed > 1e-8:
+            # 刹车时沿当前运动方向减速；不要让零速目标引入新的横向转向。
+            direction = (previous[0] / previous_speed, previous[1] / previous_speed)
+        else:
+            direction = (0.0, 0.0)
+
+        increasing = target_speed >= previous_speed
+        acceleration = self.limits.max_acceleration if increasing else self.limits.max_braking
+        maximum_change = acceleration * self.dt
+        speed_change = max(-maximum_change, min(maximum_change, target_speed - previous_speed))
+        command_speed = max(0.0, previous_speed + speed_change)
+        command = (direction[0] * command_speed, direction[1] * command_speed)
+        self._previous_command = command
+        return command
+
+    def _is_holding_at(self, timed_sample, elapsed, progress):
+        """仅在规划的航点悬停时段保持零速度。"""
+        if math.hypot(timed_sample.vx, timed_sample.vy) > 0.05:
+            return False
+        if abs(timed_sample.distance - progress) > 0.15:
+            return False
+        left = bisect_right(self._distances, timed_sample.distance - 1e-5)
+        right = bisect_right(self._distances, timed_sample.distance + 1e-5)
+        if right - left < 2:
+            return False
+        first_time = self._times[left]
+        last_time = self._times[right - 1]
+        return first_time - 1e-6 <= elapsed <= last_time + 1e-6
+
+    def _result(self, command, z, progress, deviation, reference, mode,
+                planned_speed=0.0):
+        return ControlResult(
+            command[0], command[1], z, progress, deviation,
+            warning=self._last_warning,
+            reference_x=reference.x,
+            reference_y=reference.y,
+            reference_z=reference.z,
+            reference_distance=reference.distance,
+            sample_period=self.dt,
+            controller_mode=mode,
+            waypoint_passages=self._last_waypoint_passages,
+            reference_curvature=reference.curvature,
+            planned_speed=planned_speed,
+        )
 
 
-def _blend(first, second, fraction):
-    """在轨迹采样之间插值，保持字段含义一致。"""
-    from .models import TrajectorySample
-
-    def mix(a, b):
-        return a + fraction * (b - a)
-
-    return TrajectorySample(
-        time=mix(first.time, second.time),
-        distance=mix(first.distance, second.distance),
-        x=mix(first.x, second.x), y=mix(first.y, second.y), z=mix(first.z, second.z),
-        vx=mix(first.vx, second.vx), vy=mix(first.vy, second.vy), vz=mix(first.vz, second.vz),
-        ax=mix(first.ax, second.ax), ay=mix(first.ay, second.ay), az=mix(first.az, second.az),
-        curvature=mix(first.curvature, second.curvature),
-        waypoint_index=first.waypoint_index if fraction < 0.5 else second.waypoint_index,
+def _blend(first: TrajectorySample, second: TrajectorySample, fraction: float):
+    """对相邻采样插值，保证日志和控制使用一致的曲线值。"""
+    names = (
+        "time", "distance", "x", "y", "z", "vx", "vy", "vz",
+        "ax", "ay", "az", "curvature",
     )
+    values = {
+        name: getattr(first, name) + fraction * (getattr(second, name) - getattr(first, name))
+        for name in names
+    }
+    values["waypoint_index"] = first.waypoint_index
+    return TrajectorySample(**values)

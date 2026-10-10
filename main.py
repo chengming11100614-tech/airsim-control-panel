@@ -35,7 +35,7 @@ from navigation.demo import demo_obstacles, demo_waypoints
 from navigation.telemetry import deviation_to_path
 from navigation.calibration import (SPEED_STEPS, CalibrationSample,
                                     analyze_calibration)
-from navigation.controller import PredictivePathController
+from navigation.controller import CarrotPathController
 from navigation.geometry import InflatedCircle, segment_clear
 from navigation.models import CalibrationProfile, CircleObstacle, KinematicLimits, Waypoint
 from navigation.planner import PlanningError, plan_ordered_route
@@ -74,7 +74,7 @@ FONT_L  = ("Microsoft YaHei UI", 11, "bold")
 FONT_XL = ("Consolas", 20, "bold")
 
 DEFAULT_ALT = 5.0        # 默认巡航高度（离地，米）
-DEFAULT_SPD = 15.0       # 全局最高允许速度；未标定时规划器仍限制为 2 m/s
+DEFAULT_SPD = 15.0       # 用户设定的最高速度；实际速度由路线和动力学约束决定
 POSITION_EPS = 0.6       # 到点判定容差（米）
 DEV_WARN = 3.0           # 手动模式偏差告警阈值（米）
 
@@ -123,7 +123,8 @@ class FlightRecorder:
               "roll", "pitch", "yaw", "dev", "wp", "wp_error",
               "obs_clearance", "sway_count", "flight_elapsed", "mode",
               "cmd_vx", "cmd_vy", "ref_x", "ref_y", "ref_z",
-              "ref_distance", "controller_dt", "solver_status",
+              "ref_distance", "ref_curvature", "planned_speed",
+              "controller_dt", "controller_mode",
               "passage_wp", "passage_error"]
 
     def __init__(self, out_dir=None):
@@ -281,6 +282,8 @@ class GCSApp:
         self._max_waypoint_error = 0.0
         self._waypoint_passage_errors = {}
         self._cruise_deviations = []
+        self._straight_deviations = []
+        self._curve_deviations = []
         self._control_debug = {}
         self._minimum_cruise_clearance = float("inf")
         self._cruise_elapsed = 0.0
@@ -756,12 +759,6 @@ class GCSApp:
                  self.waypoints[self.cruise_index].z),
             )
         row["wp_error"] = round(waypoint_error, 3)
-        if self._cruise_active:
-            self._cruise_deviations.append(dev["dist"])
-            self._minimum_cruise_clearance = min(
-                self._minimum_cruise_clearance, obstacle_clearance
-            )
-            self._update_sway_count(dev)
         row["sway_count"] = self._sway_count
         row["flight_elapsed"] = self._cruise_elapsed
 
@@ -771,6 +768,18 @@ class GCSApp:
             self.trail.append((x, y, z))
             if len(self.trail) > 4000:   # 只留最近的一段，画布才画得动
                 del self.trail[:2000]
+
+        if self._cruise_active:
+            self._cruise_deviations.append(dev["dist"])
+            curvature = abs(row.get("ref_curvature", 0.0))
+            if curvature <= 0.02:  # 曲率单位为 1/m；小于此值视为直线段
+                self._straight_deviations.append(dev["dist"])
+            else:
+                self._curve_deviations.append(dev["dist"])
+            self._minimum_cruise_clearance = min(
+                self._minimum_cruise_clearance, obstacle_clearance
+            )
+            self._update_sway_count(dev)
 
         recorder = self.recorder
         if recorder is not None:
@@ -1124,8 +1133,8 @@ class GCSApp:
 
     @staticmethod
     def _limits_for_planning(requested_speed, clearance, profile):
-        """未标定时锁在 2 m/s；标定后才允许使用实测安全速度。"""
-        available_speed = profile.safe_max_speed if profile.calibrated else 2.0
+        """未标定时仍允许竞速上限，但用保守动力学能力生成逐点速度曲线。"""
+        available_speed = profile.safe_max_speed if profile.calibrated else 15.0
         return KinematicLimits(
             max_speed=min(15.0, requested_speed, available_speed),
             max_vertical_speed=2.0,
@@ -1173,25 +1182,31 @@ class GCSApp:
         self.route = route
         self.route_xy = [(sample.x, sample.y) for sample in trajectory.samples]
         self.route_cum = [sample.distance for sample in trajectory.samples]
+        planned_peak_speed = max(
+            math.sqrt(sample.vx ** 2 + sample.vy ** 2 + sample.vz ** 2)
+            for sample in trajectory.samples
+        )
         self.info = {
             "length": trajectory.length,
             "time": trajectory.estimated_time,
             "minimum_clearance": trajectory.minimum_clearance,
             "max_speed": limits.max_speed,
+            "planned_peak_speed": planned_peak_speed,
         }
 
         self._log(
-            "规划完成：%.1f 米，预计 %.1f 秒，速度上限 %.1f m/s，净空 %.2f m（%.2f 秒）"
+            "规划完成：%.1f 米，预计 %.1f 秒，允许上限 %.1f m/s，计划峰值 %.1f m/s，净空 %.2f m（%.2f 秒）"
             % (trajectory.length, trajectory.estimated_time, limits.max_speed,
+               planned_peak_speed,
                trajectory.minimum_clearance, time.time() - t0), "ok")
 
         def upd():
             self.lbl_plan.configure(
                 text=("连续平滑轨迹：%.1f 米 / 预计 T %.1f 秒\n"
-                      "可用速度上限 %.1f m/s；最低障碍边缘净空 %.2f m\n"
+                      "允许速度上限 %.1f m/s / 计划峰值 %.1f m/s；最低障碍边缘净空 %.2f m\n"
                       "按输入顺序经过 %d 个航点，曲线全程已校验避障。"
                       % (trajectory.length, trajectory.estimated_time, limits.max_speed,
-                         trajectory.minimum_clearance, len(waypoints))),
+                         planned_peak_speed, trajectory.minimum_clearance, len(waypoints))),
                 fg=OK)
         self.ui_q.put(("call", upd))
 
@@ -1385,7 +1400,7 @@ class GCSApp:
 
         result = analyze_calibration(samples, limits.max_lateral_acceleration)
         if not result.profile.calibrated:
-            self._log("速度标定没有通过 0.25 m 偏差目标；继续使用保守 2 m/s。", "warn")
+            self._log("本次标定未通过 0.25 m 偏差目标；保留现有动力学参数，巡航继续按路线速度曲线限速。", "warn")
             return
         self.calibration_profile = result.profile
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration.json")
@@ -1493,6 +1508,8 @@ class GCSApp:
         self._max_waypoint_error = 0.0
         self._waypoint_passage_errors = {}
         self._cruise_deviations = []
+        self._straight_deviations = []
+        self._curve_deviations = []
         self._minimum_cruise_clearance = float("inf")
         self._cruise_elapsed = 0.0
         self._cruise_active = True
@@ -1507,7 +1524,7 @@ class GCSApp:
                           % math.dist(actual_start, planned_start), "err")
                 return
 
-            controller = PredictivePathController(trajectory, limits, obstacles)
+            controller = CarrotPathController(trajectory, limits, obstacles)
             self._log("开始沿平滑轨迹巡航：预计 T %.1f 秒，速度上限 %.1f m/s。"
                       % (trajectory.estimated_time, limits.max_speed), "hi")
             elapsed = 0.0
@@ -1587,8 +1604,10 @@ class GCSApp:
                         "ref_y": round(result.reference_y, 4),
                         "ref_z": round(result.reference_z, 4),
                         "ref_distance": round(result.reference_distance, 4),
+                        "ref_curvature": round(result.reference_curvature, 6),
+                        "planned_speed": round(result.planned_speed, 4),
                         "controller_dt": round(result.sample_period, 5),
-                        "solver_status": result.solver_status,
+                        "controller_mode": result.controller_mode,
                         "passage_wp": ";".join(passage_indices),
                         "passage_error": ";".join(passage_errors),
                     }
@@ -1621,15 +1640,15 @@ class GCSApp:
                     sum(distance <= result.progress + 1e-6
                         for distance in trajectory.waypoint_distances),
                 )
+                if result.finished:
+                    completed = True
+                    break
                 self.client.moveByVelocityZAsync(
                     result.vx, result.vy, result.z,
                     max(0.08, min(0.14, result.sample_period * 1.5)),
                     drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
                     yaw_mode=airsim.YawMode(is_rate=False, yaw_or_rate=0.0),
                 )
-                if result.finished:
-                    completed = True
-                    break
                 remaining = 0.05 - (time.monotonic() - cycle_start)
                 if remaining > 0.0:
                     time.sleep(remaining)
@@ -1650,6 +1669,16 @@ class GCSApp:
             deviations = sorted(self._cruise_deviations)
             p95 = (deviations[max(0, math.ceil(0.95 * len(deviations)) - 1)]
                    if deviations else 0.0)
+            straight = sorted(self._straight_deviations)
+            straight_p95 = (
+                straight[max(0, math.ceil(0.95 * len(straight)) - 1)]
+                if straight else 0.0
+            )
+            curves = sorted(self._curve_deviations)
+            curve_p95 = (
+                curves[max(0, math.ceil(0.95 * len(curves)) - 1)]
+                if curves else 0.0
+            )
             minimum = self._minimum_cruise_clearance
             clearance_text = "%.2f m" % minimum if math.isfinite(minimum) else "无障碍物"
             failed_waypoints = [
@@ -1665,10 +1694,11 @@ class GCSApp:
                         % (failed_waypoints, missing_waypoints))
             self._log(
                 "巡航完成：实际 T %.1f s；航点最大误差 %.3f m；"
-                "横向偏差 P95 %.3f m；最低障碍边缘净空 %s；直线摆动 %d 次；%s。"
-                % (elapsed, self._max_waypoint_error, p95,
+                "全程/直线/弯道横向偏差 P95 %.3f/%.3f/%.3f m；"
+                "最低障碍边缘净空 %s；直线摆动 %d 次；%s。"
+                % (elapsed, self._max_waypoint_error, p95, straight_p95, curve_p95,
                    clearance_text, self._sway_count, accuracy),
-                "ok" if accuracy == "航点精度达标" and p95 <= 0.25 else "warn")
+                "ok" if accuracy == "航点精度达标" and straight_p95 <= 0.25 else "warn")
         elif self.stop_evt.is_set():
             self._log("巡航已停止，飞机悬停。", "warn")
 
