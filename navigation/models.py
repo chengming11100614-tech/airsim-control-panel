@@ -97,6 +97,9 @@ class CalibrationProfile:
     command_delay: float = 0.10
     cross_track_p95: float = 0.0
     tested_speeds: Tuple[float, ...] = ()
+    # 速度指令到实际速度的响应模型。它与规划速度曲线的加速度上限不同。
+    velocity_time_constant: float = 1.4
+    velocity_acceleration: float = 1.25
 
 
 @dataclass(frozen=True)
@@ -112,6 +115,9 @@ class KinematicLimits:
     command_delay: float = 0.10
     safety_clearance: float = 0.8
     tracking_reserve: float = 0.25
+    # AirSim 实测速度响应：一阶时间常数和速度矢量最大变化率。
+    velocity_time_constant: float = 1.4
+    velocity_acceleration: float = 1.25
 
 
 @dataclass(frozen=True)
@@ -139,6 +145,18 @@ class TrajectorySample:
 
 
 @dataclass(frozen=True)
+class ExecutionPrediction:
+    """用巡航控制器和 AirSim 响应模型闭环仿真的实际飞行轨迹。"""
+
+    samples: Tuple[TrajectorySample, ...]
+    estimated_time: float
+    minimum_clearance: float
+    waypoint_errors: Tuple[float, ...]
+    complete: bool
+    safe: bool
+
+
+@dataclass(frozen=True)
 class PlannedTrajectory:
     """规划结果及其任务身份信息。
 
@@ -152,8 +170,12 @@ class PlannedTrajectory:
     length: float
     minimum_clearance: float
     mission_signature: str
+    execution_prediction: Optional[ExecutionPrediction] = None
+    nominal_time: Optional[float] = None
 
     @property
     def duration(self) -> float:
-        """轨迹的飞行时长（不含到点悬停）。"""
+        """返回模拟飞行时长；尚未模拟时使用理想速度曲线时长。"""
+        if self.execution_prediction is not None:
+            return self.execution_prediction.estimated_time
         return self.samples[-1].time if self.samples else 0.0

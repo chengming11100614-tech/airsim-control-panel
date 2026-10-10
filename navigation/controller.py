@@ -334,18 +334,17 @@ class CarrotPathController:
         """
         current_speed = self._scheduled_speed(progress)
         response_horizon = max(
-            0.0, self.limits.response_time + self.limits.command_delay
+            0.0,
+            max(self.limits.response_time, self.limits.velocity_time_constant)
+            + self.limits.command_delay,
         )
         if response_horizon <= 1e-6 or progress >= self._distances[-1] - 1e-5:
             return current_speed
 
-        lead_distance = min(
-            1.5,
-            max(
-                0.25,
-                actual_speed * response_horizon
-                + 0.5 * self.limits.max_acceleration * response_horizon ** 2,
-            ),
+        lead_distance = max(
+            0.25,
+            actual_speed * response_horizon
+            + 0.5 * self.limits.max_acceleration * response_horizon ** 2,
         )
         target_distance = min(self._distances[-1], progress + lead_distance)
         future_speed = self._scheduled_speed(target_distance)
@@ -393,7 +392,8 @@ class CarrotPathController:
         """把响应延迟计入末点制动，防止速度曲线误差导致明显冲过终点。"""
         target_distance = self.trajectory.waypoint_distances[-1]
         remaining = max(0.0, target_distance - progress - 0.10)
-        delay = self.limits.response_time + self.limits.command_delay
+        delay = (max(self.limits.response_time, self.limits.velocity_time_constant)
+                 + self.limits.command_delay)
         delayed_distance = self.limits.max_braking * delay
         return max(
             0.0,

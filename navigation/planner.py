@@ -6,7 +6,8 @@ import json
 import math
 from typing import Sequence, Tuple
 
-from .curve import CurveSamples, fit_safe_curve, splice_straight_leg
+from .curve import fit_safe_curve, splice_straight_leg
+from .execution import predict_execution
 from .geometry import (
     GeometricPath,
     InflatedCircle,
@@ -51,6 +52,7 @@ def plan_ordered_route(
         limits.max_speed, limits.max_vertical_speed, limits.max_acceleration,
         limits.max_braking, limits.max_lateral_acceleration, limits.response_time,
         limits.command_delay, limits.safety_clearance, limits.tracking_reserve,
+        limits.velocity_time_constant, limits.velocity_acceleration,
     )
     if not all(math.isfinite(value) for value in numeric_limits):
         raise PlanningError("飞行约束必须是有限数值")
@@ -59,8 +61,9 @@ def plan_ordered_route(
     if limits.max_speed <= 0.0:
         raise PlanningError("最高速度必须大于 0 m/s")
     if min(limits.max_vertical_speed, limits.max_acceleration,
-           limits.max_braking, limits.max_lateral_acceleration) <= 0.0:
-        raise PlanningError("垂直速度、加速度、制动能力和横向加速度必须大于 0")
+           limits.max_braking, limits.max_lateral_acceleration,
+           limits.velocity_time_constant, limits.velocity_acceleration) <= 0.0:
+        raise PlanningError("速度、加速度、制动、横向能力和机体响应参数必须大于 0")
     if (limits.safety_clearance < 0.0 or limits.tracking_reserve < 0.0
             or limits.response_time < 0.0 or limits.command_delay < 0.0):
         raise PlanningError("安全间距、跟踪余量和响应延迟不能为负数")
@@ -173,24 +176,28 @@ def plan_ordered_route(
 
         for curve in curve_candidates:
             try:
-                trajectory = time_parameterize(curve, waypoints, limits, signature)
+                nominal = time_parameterize(curve, waypoints, limits, signature)
+                prediction = predict_execution(nominal, limits, obstacles)
             except ValueError:
                 continue
-            clearance = _minimum_center_clearance(curve.positions, obstacles)
+            if not prediction.safe:
+                continue
             trajectory = PlannedTrajectory(
-                samples=trajectory.samples,
-                waypoint_distances=trajectory.waypoint_distances,
-                estimated_time=trajectory.estimated_time,
-                length=trajectory.length,
-                minimum_clearance=clearance,
-                mission_signature=trajectory.mission_signature,
+                samples=nominal.samples,
+                waypoint_distances=nominal.waypoint_distances,
+                estimated_time=prediction.estimated_time,
+                length=nominal.length,
+                minimum_clearance=prediction.minimum_clearance,
+                mission_signature=nominal.mission_signature,
+                execution_prediction=prediction,
+                nominal_time=nominal.estimated_time,
             )
-            feasible.append((trajectory.estimated_time, topology, trajectory))
+            feasible.append((prediction.estimated_time, topology, trajectory))
 
     if not feasible:
         raise PlanningError(
-            "切线候选无法在保持安全间距时平滑通过所有航点；"
-            "请放宽障碍间距或调整航点，系统不会改用直线穿过障碍"
+            "没有候选路线能在实飞响应模型下完整经过航点并保留所需障碍净空；"
+            "请调整航点或安全间距，系统不会改用直线穿过障碍"
         )
     feasible.sort(key=lambda item: (item[0], item[1]))
     return feasible[0][2]
@@ -260,17 +267,6 @@ def _three_point_curvature(a, b, c):
     return 2.0 * twice_area / denominator if denominator > 1e-10 else 0.0
 
 
-def _minimum_center_clearance(points, obstacles):
-    """记录轨迹采样到真实障碍圆边缘的最小中心距离。"""
-    if not obstacles:
-        return float("inf")
-    return min(
-        math.hypot(point[0] - obstacle.x, point[1] - obstacle.y) - obstacle.radius
-        for point in points
-        for obstacle in obstacles
-    )
-
-
 def _point_clear(point, circles):
     return all(math.hypot(point[0] - circle.x, point[1] - circle.y)
                >= circle.radius - 1e-7 for circle in circles)
@@ -289,6 +285,7 @@ def _mission_signature(start, waypoints, obstacles, limits, settings):
             limits.max_braking, limits.max_lateral_acceleration,
             limits.response_time, limits.command_delay,
             limits.safety_clearance, limits.tracking_reserve,
+            limits.velocity_time_constant, limits.velocity_acceleration,
         )],
         "settings": [settings.max_candidates_per_leg, settings.beam_width,
                      round(settings.curve_margin, 5), round(settings.sample_spacing, 5)],

@@ -89,9 +89,14 @@ def time_parameterize(
         speed_cap[index] = 0.0
 
     # 将响应延迟作为一次制动事件处理，而不是每个 10 cm 采样重复扣除一次。
-    response_delay = max(0.0, limits.response_time + limits.command_delay)
+    # 用实测机体时间常数安排提前制动；仅使用通信延迟会让速度曲线晚刹。
+    braking_delay = max(
+        0.0,
+        max(limits.response_time, limits.velocity_time_constant)
+        + limits.command_delay,
+    )
     speed_cap = _apply_delayed_braking_caps(
-        speed_cap, distances, limits.max_braking, response_delay
+        speed_cap, distances, limits.max_braking, braking_delay
     )
 
     # 在速度平方域做可达性传播，v² 的变化与距离成线性关系。
@@ -119,7 +124,10 @@ def time_parameterize(
         base_times.append(base_times[-1] + dt)
 
     # 趋势切换处补上实测响应延迟，使曲线定时、航点悬停和总 T 使用同一时钟。
-    base_times = _add_response_delays(base_times, speeds, response_delay)
+    # 时间戳只表示实测指令响应延迟；机体时间常数已用于提前制动和闭环仿真，
+    # 不要在每次离散速度趋势切换时重复加上一整段时间常数。
+    schedule_delay = max(0.0, limits.response_time + limits.command_delay)
+    base_times = _add_response_delays(base_times, speeds, schedule_delay)
 
     waypoint_by_sample = {}
     for waypoint_index, sample_index in enumerate(waypoint_sample_indices):

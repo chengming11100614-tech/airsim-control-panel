@@ -1145,6 +1145,8 @@ class GCSApp:
             command_delay=max(0.0, profile.command_delay),
             safety_clearance=clearance,
             tracking_reserve=max(0.25, profile.cross_track_p95),
+            velocity_time_constant=profile.velocity_time_constant,
+            velocity_acceleration=profile.velocity_acceleration,
         )
 
     def _job_plan(self, limits, alt, waypoints, obstacles, revision):
@@ -1174,39 +1176,53 @@ class GCSApp:
             self._log("规划期间航点或参数发生变化，已丢弃旧规划结果。", "warn")
             return
 
-        route = [sample.position for sample in trajectory.samples]
+        execution = trajectory.execution_prediction
+        route_samples = execution.samples if execution is not None else trajectory.samples
+        route = [sample.position for sample in route_samples]
         self.trajectory = trajectory
         self.plan_limits = limits
         self.plan_start = start
         self.route_revision = revision
         self.route = route
-        self.route_xy = [(sample.x, sample.y) for sample in trajectory.samples]
-        self.route_cum = [sample.distance for sample in trajectory.samples]
+        self.route_xy = [(sample.x, sample.y) for sample in route_samples]
+        self.route_cum = [sample.distance for sample in route_samples]
+        predicted_length = route_samples[-1].distance
+        predicted_waypoint_error = max(
+            execution.waypoint_errors, default=0.0
+        ) if execution is not None else 0.0
         planned_peak_speed = max(
             math.sqrt(sample.vx ** 2 + sample.vy ** 2 + sample.vz ** 2)
-            for sample in trajectory.samples
+            for sample in route_samples
         )
         self.info = {
-            "length": trajectory.length,
+            "length": predicted_length,
+            "guide_length": trajectory.length,
             "time": trajectory.estimated_time,
             "minimum_clearance": trajectory.minimum_clearance,
+            "waypoint_error": predicted_waypoint_error,
             "max_speed": limits.max_speed,
             "planned_peak_speed": planned_peak_speed,
         }
 
         self._log(
-            "规划完成：%.1f 米，预计 %.1f 秒，允许上限 %.1f m/s，计划峰值 %.1f m/s，净空 %.2f m（%.2f 秒）"
-            % (trajectory.length, trajectory.estimated_time, limits.max_speed,
-               planned_peak_speed,
+            "规划完成：预测飞行线 %.1f 米（引导线 %.1f 米），闭环预测 T %.1f 秒"
+            "（理想速度曲线 %.1f 秒），允许上限 %.1f m/s，预测峰值 %.1f m/s，"
+            "航点最大误差 %.2f m、预测净空 %.2f m（%.2f 秒）"
+            % (predicted_length, trajectory.length, trajectory.estimated_time,
+               trajectory.nominal_time or trajectory.estimated_time, limits.max_speed,
+               planned_peak_speed, predicted_waypoint_error,
                trajectory.minimum_clearance, time.time() - t0), "ok")
 
         def upd():
             self.lbl_plan.configure(
-                text=("连续平滑轨迹：%.1f 米 / 预计 T %.1f 秒\n"
-                      "允许速度上限 %.1f m/s / 计划峰值 %.1f m/s；最低障碍边缘净空 %.2f m\n"
-                      "按输入顺序经过 %d 个航点，曲线全程已校验避障。"
-                      % (trajectory.length, trajectory.estimated_time, limits.max_speed,
-                         planned_peak_speed, trajectory.minimum_clearance, len(waypoints))),
+                text=("预测飞行线 %.1f 米（引导线 %.1f 米）/ 闭环预测 T %.1f 秒（理想 %.1f 秒）\n"
+                      "允许速度上限 %.1f m/s / 预测峰值 %.1f m/s；航点误差 %.2f m、预测净空 %.2f m\n"
+                      "按输入顺序经过 %d 个航点；显示线为响应模型预测的实际飞行轨迹。"
+                      % (predicted_length, trajectory.length, trajectory.estimated_time,
+                         trajectory.nominal_time or trajectory.estimated_time,
+                         limits.max_speed,
+                         planned_peak_speed, predicted_waypoint_error,
+                         trajectory.minimum_clearance, len(waypoints))),
                 fg=OK)
         self.ui_q.put(("call", upd))
 
@@ -1414,10 +1430,13 @@ class GCSApp:
                      if trial.speed <= result.profile.safe_max_speed)
         self._log(
             "标定完成：安全上限 %.1f m/s，沿线偏差 P95 %.3f m；"
-            "加速度 %.2f、制动 %.2f m/s²，响应 %.2f s。"
+            "加速度 %.2f、制动 %.2f m/s²，响应 %.2f s；"
+            "速度模型 τ %.2f s / 矢量加速度 %.2f m/s²。"
             % (result.profile.safe_max_speed, result.profile.cross_track_p95,
                result.profile.acceleration, result.profile.braking,
-               result.profile.response_time), "ok")
+               result.profile.response_time,
+               result.profile.velocity_time_constant,
+               result.profile.velocity_acceleration), "ok")
         if passed < 15.0:
             self._log("15 m/s 未达到精度/速度条件，后续规划采用已通过的 %.1f m/s。"
                       % passed, "warn")

@@ -11,6 +11,7 @@ from navigation.calibration import (
 )
 from navigation.controller import CarrotPathController
 from navigation.curve import fit_safe_curve
+from navigation.execution import predict_execution
 from navigation.geometry import inflate_obstacles, plan_leg_candidates
 from navigation.models import (
     CircleObstacle,
@@ -125,7 +126,7 @@ class RoutePlanningTests(unittest.TestCase):
         long_speeds = [math.sqrt(sample.vx ** 2 + sample.vy ** 2 + sample.vz ** 2)
                        for sample in long.samples]
         self.assertLess(max(short_speeds), 5.0)
-        self.assertGreater(max(long_speeds), 13.5)
+        self.assertGreater(max(long_speeds), 13.0)
 
         # 速度平方沿距离的变化必须满足 v² 差 <= 2*a*距离，
         # 分别验证加速和制动方向，确保短路线不会虚构瞬时提速或刹停。
@@ -143,7 +144,7 @@ class RoutePlanningTests(unittest.TestCase):
                     2.0 * limits.max_braking * distance + 1e-5,
                 )
 
-    def test_route_selection_prefers_lower_time_over_shorter_distance(self):
+    def test_route_selection_uses_closed_loop_time_not_ideal_curve_time(self):
         obstacles = [
             CircleObstacle(4.8982827148, 0.6298900106, 1.1997694240),
             CircleObstacle(3.5704014117, -1.9565582276, 0.9372790429),
@@ -165,18 +166,25 @@ class RoutePlanningTests(unittest.TestCase):
             curve = fit_safe_curve(points, [len(points) - 1], protected,
                                   settings.sample_spacing)
             if curve is not None:
-                estimate = time_parameterize(curve, [waypoint], limits, "candidate")
-                estimates.append((candidate.length, estimate.estimated_time))
+                nominal = time_parameterize(curve, [waypoint], limits, "candidate")
+                prediction = predict_execution(nominal, limits, obstacles)
+                if prediction.safe:
+                    estimates.append((candidate.length, nominal.estimated_time,
+                                      prediction.estimated_time))
         self.assertGreaterEqual(len(estimates), 2)
         shortest = min(estimates, key=lambda row: row[0])
-        fastest = min(estimates, key=lambda row: row[1])
-        self.assertGreater(fastest[0], shortest[0] + 0.5)
-        self.assertLess(fastest[1], shortest[1])
+        fastest_predicted = min(estimates, key=lambda row: row[2])
+        self.assertGreater(fastest_predicted[0], shortest[0] + 0.5)
+        self.assertLess(fastest_predicted[2], shortest[2])
 
         selected = plan_ordered_route(
             (0, 0, -5), [waypoint], obstacles, limits, settings
         )
-        self.assertAlmostEqual(selected.estimated_time, fastest[1], places=5)
+        self.assertAlmostEqual(selected.estimated_time, fastest_predicted[2], places=5)
+        self.assertAlmostEqual(selected.nominal_time, fastest_predicted[1], places=5)
+        self.assertGreaterEqual(selected.minimum_clearance,
+                                limits.safety_clearance + limits.tracking_reserve)
+        self.assertTrue(selected.execution_prediction.safe)
         self.assertGreater(selected.length, shortest[0] + 0.5)
 
     def test_uncalibrated_panel_keeps_user_speed_cap_for_time_planning(self):
@@ -397,7 +405,8 @@ class ControllerTests(unittest.TestCase):
         self.assertGreater(preview, current)
         self.assertLessEqual(
             preview, current + limits.max_acceleration
-            * (limits.response_time + limits.command_delay) + 1e-9,
+            * (max(limits.response_time, limits.velocity_time_constant)
+               + limits.command_delay) + 1e-9,
         )
 
         curved = CarrotPathController(trajectory(0.5), limits)
@@ -539,6 +548,36 @@ class CalibrationTests(unittest.TestCase):
         result = analyze_calibration(samples)
         self.assertTrue(result.profile.calibrated)
         self.assertEqual(result.profile.safe_max_speed, 4.0)
+
+    def test_calibration_fits_aircraft_velocity_response_from_speed_steps(self):
+        samples = []
+        actual_speed = 0.0
+        timestamp = 0.0
+        time_constant = 0.8
+        acceleration = 1.2
+        for requested_speed, phase, duration in (
+                (2.0, "speed", 2.0), (4.0, "speed", 2.0),
+                (6.0, "speed", 2.0), (0.0, "braking", 2.0)):
+            for _ in range(int(duration / 0.05)):
+                samples.append(CalibrationSample(
+                    time=timestamp,
+                    requested_speed=requested_speed,
+                    along_speed=actual_speed,
+                    cross_track=0.05,
+                    phase=phase,
+                ))
+                change = (requested_speed - actual_speed) * (
+                    1.0 - math.exp(-0.05 / time_constant)
+                )
+                change = max(-acceleration * 0.05,
+                             min(acceleration * 0.05, change))
+                actual_speed += change
+                timestamp += 0.05
+
+        profile = analyze_calibration(samples).profile
+
+        self.assertAlmostEqual(profile.velocity_time_constant, time_constant, delta=0.15)
+        self.assertAlmostEqual(profile.velocity_acceleration, acceleration, delta=0.15)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@
 from .models import (
     CalibrationProfile,
     CircleObstacle,
+    ExecutionPrediction,
     KinematicLimits,
     PlannedTrajectory,
     TrajectorySample,
@@ -15,6 +16,7 @@ from .models import (
 __all__ = [
     "CalibrationProfile",
     "CircleObstacle",
+    "ExecutionPrediction",
     "KinematicLimits",
     "PlannedTrajectory",
     "TrajectorySample",
