@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+.worktrees/
 
 # AirSim runtime settings and secrets
 .env
