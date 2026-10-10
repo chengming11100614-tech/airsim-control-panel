@@ -121,7 +121,10 @@ class FlightRecorder:
 
     FIELDS = ["t", "x", "y", "z", "alt", "vx", "vy", "vz",
               "roll", "pitch", "yaw", "dev", "wp", "wp_error",
-              "obs_clearance", "sway_count", "flight_elapsed", "mode"]
+              "obs_clearance", "sway_count", "flight_elapsed", "mode",
+              "cmd_vx", "cmd_vy", "ref_x", "ref_y", "ref_z",
+              "ref_distance", "controller_dt", "solver_status",
+              "passage_wp", "passage_error"]
 
     def __init__(self, out_dir=None):
         self.out_dir = out_dir or os.path.join(
@@ -276,7 +279,9 @@ class GCSApp:
         self._sway_count = 0
         self._sway_side = 0
         self._max_waypoint_error = 0.0
+        self._waypoint_passage_errors = {}
         self._cruise_deviations = []
+        self._control_debug = {}
         self._minimum_cruise_clearance = float("inf")
         self._cruise_elapsed = 0.0
         self.recorder = None
@@ -756,17 +761,12 @@ class GCSApp:
             self._minimum_cruise_clearance = min(
                 self._minimum_cruise_clearance, obstacle_clearance
             )
-            waypoint_index = self.cruise_index
-            if (self.trajectory is not None
-                    and 0 <= waypoint_index < len(self.trajectory.waypoint_distances)
-                    and abs(dev.get("s", 0.0)
-                            - self.trajectory.waypoint_distances[waypoint_index]) <= 1.0):
-                self._max_waypoint_error = max(self._max_waypoint_error, waypoint_error)
             self._update_sway_count(dev)
         row["sway_count"] = self._sway_count
         row["flight_elapsed"] = self._cruise_elapsed
 
         with self._lock:
+            row.update(self._control_debug)
             self.telem = row
             self.trail.append((x, y, z))
             if len(self.trail) > 4000:   # 只留最近的一段，画布才画得动
@@ -1491,6 +1491,7 @@ class GCSApp:
         self._sway_count = 0
         self._sway_side = 0
         self._max_waypoint_error = 0.0
+        self._waypoint_passage_errors = {}
         self._cruise_deviations = []
         self._minimum_cruise_clearance = float("inf")
         self._cruise_elapsed = 0.0
@@ -1511,6 +1512,7 @@ class GCSApp:
                       % (trajectory.estimated_time, limits.max_speed), "hi")
             elapsed = 0.0
             previous_tick = time.monotonic()
+            last_telemetry_time = None
             last_warning_key = ""
             last_warning_time = 0.0
             while not self.stop_evt.is_set():
@@ -1533,6 +1535,7 @@ class GCSApp:
                         self._log("无法安全接回原轨迹：%s；飞机保持悬停。" % fault, "err")
                         break
                     previous_tick = time.monotonic()
+                    last_telemetry_time = resumed.get("monotonic")
                     self._log("已安全接回原轨迹，继续巡航。", "ok")
                     continue
 
@@ -1548,11 +1551,47 @@ class GCSApp:
                     self._log("遥测超过 0.30 秒未更新，已悬停并中止巡航。", "err")
                     break
 
+                sample_time = telemetry.get("monotonic", 0.0)
+                if last_telemetry_time is not None:
+                    observed_period = sample_time - last_telemetry_time
+                    if observed_period <= 0.0:
+                        time.sleep(0.005)
+                        continue
+                    controller.update_period(observed_period)
+                last_telemetry_time = sample_time
+
                 result = controller.step(
                     (telemetry["x"], telemetry["y"], telemetry["z"]),
                     (telemetry["vx"], telemetry["vy"], telemetry["vz"]),
                     elapsed,
                 )
+                passage_indices = []
+                passage_errors = []
+                for waypoint_index, error in result.waypoint_passages:
+                    self._waypoint_passage_errors[waypoint_index] = error
+                    self._max_waypoint_error = max(self._max_waypoint_error, error)
+                    passage_indices.append(str(waypoint_index + 1))
+                    passage_errors.append("%.3f" % error)
+                    tag = "warn" if error > 0.25 else "ok"
+                    self._log(
+                        "第 %d 个航点经过误差 %.3f m%s"
+                        % (waypoint_index + 1, error,
+                           "，超过 0.25 m 目标" if error > 0.25 else ""),
+                        tag,
+                    )
+                with self._lock:
+                    self._control_debug = {
+                        "cmd_vx": round(result.vx, 4),
+                        "cmd_vy": round(result.vy, 4),
+                        "ref_x": round(result.reference_x, 4),
+                        "ref_y": round(result.reference_y, 4),
+                        "ref_z": round(result.reference_z, 4),
+                        "ref_distance": round(result.reference_distance, 4),
+                        "controller_dt": round(result.sample_period, 5),
+                        "solver_status": result.solver_status,
+                        "passage_wp": ";".join(passage_indices),
+                        "passage_error": ";".join(passage_errors),
+                    }
                 if result.warning:
                     if "航点" in result.warning:
                         warning_key = "航点经过偏差"
@@ -1583,7 +1622,8 @@ class GCSApp:
                         for distance in trajectory.waypoint_distances),
                 )
                 self.client.moveByVelocityZAsync(
-                    result.vx, result.vy, result.z, 0.12,
+                    result.vx, result.vy, result.z,
+                    max(0.08, min(0.14, result.sample_period * 1.5)),
                     drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
                     yaw_mode=airsim.YawMode(is_rate=False, yaw_or_rate=0.0),
                 )
@@ -1602,6 +1642,8 @@ class GCSApp:
                 pass
             self._cruise_active = False
             self.cruise_index = -1
+            with self._lock:
+                self._control_debug = {}
             self._set_mode("已连接")
 
         if completed:
@@ -1610,11 +1652,23 @@ class GCSApp:
                    if deviations else 0.0)
             minimum = self._minimum_cruise_clearance
             clearance_text = "%.2f m" % minimum if math.isfinite(minimum) else "无障碍物"
+            failed_waypoints = [
+                index + 1 for index, error in self._waypoint_passage_errors.items()
+                if error > 0.25
+            ]
+            missing_waypoints = sorted(
+                set(range(1, len(self.waypoints) + 1))
+                - {index + 1 for index in self._waypoint_passage_errors}
+            )
+            accuracy = ("航点精度达标" if not failed_waypoints and not missing_waypoints
+                        else "航点误差超标/未确认：%s%s"
+                        % (failed_waypoints, missing_waypoints))
             self._log(
                 "巡航完成：实际 T %.1f s；航点最大误差 %.3f m；"
-                "横向偏差 P95 %.3f m；最低障碍边缘净空 %s；直线摆动 %d 次。"
+                "横向偏差 P95 %.3f m；最低障碍边缘净空 %s；直线摆动 %d 次；%s。"
                 % (elapsed, self._max_waypoint_error, p95,
-                   clearance_text, self._sway_count), "ok")
+                   clearance_text, self._sway_count, accuracy),
+                "ok" if accuracy == "航点精度达标" and p95 <= 0.25 else "warn")
         elif self.stop_evt.is_set():
             self._log("巡航已停止，飞机悬停。", "warn")
 

@@ -28,6 +28,13 @@ class ControlResult:
     finished: bool = False
     fault: str = ""
     warning: str = ""
+    reference_x: float = 0.0
+    reference_y: float = 0.0
+    reference_z: float = 0.0
+    reference_distance: float = 0.0
+    sample_period: float = 0.0
+    solver_status: str = ""
+    waypoint_passages: tuple = ()
 
 
 class PredictivePathController:
@@ -45,6 +52,9 @@ class PredictivePathController:
         dt: float = 0.05,
         horizon: int = 10,
         max_cross_track: float = 1.0,
+        position_weight: float = 24.0,
+        speed_weight: float = 0.20,
+        smooth_weight: float = 3.0,
     ):
         if len(trajectory.samples) < 2:
             raise ValueError("巡航轨迹至少需要两个采样点")
@@ -54,17 +64,36 @@ class PredictivePathController:
         self.dt = dt
         self.horizon = horizon
         self.max_cross_track = max_cross_track
+        self.position_weight = position_weight
+        self.speed_weight = speed_weight
+        self.smooth_weight = smooth_weight
         self._times = [sample.time for sample in trajectory.samples]
         self._distances = [sample.distance for sample in trajectory.samples]
         self._progress_distance = 0.0
         self._previous_position = None
         self._next_waypoint = 0
         self._last_warning = ""
+        self._last_waypoint_passages = ()
         self._previous_command = np.zeros(2, dtype=float)
         self._solver, self._control_matrix = self._build_solver()
+        self._solver_period = dt
+
+    def update_period(self, observed_period: float):
+        """用相邻遥测真实间隔更新预测步长；忽略明显异常的长停顿。"""
+        if not math.isfinite(observed_period) or observed_period < 0.03 or observed_period > 0.15:
+            return
+        observed_period = min(0.10, max(0.035, observed_period))
+        updated = 0.8 * self.dt + 0.2 * observed_period
+        if abs(updated - self._solver_period) < 0.004:
+            self.dt = updated
+            return
+        self.dt = updated
+        self._solver, self._control_matrix = self._build_solver()
+        self._solver_period = self.dt
 
     def check_state(self, position):
         """检查偏航和实际障碍边界；规划膨胀余量不是碰撞边界。"""
+        self._last_waypoint_passages = ()
         x, y, z = (float(value) for value in position)
         clearance = min(
             (math.hypot(x - obstacle.x, y - obstacle.y) - obstacle.radius
@@ -105,26 +134,39 @@ class PredictivePathController:
         vx, vy = float(velocity[0]), float(velocity[1])
         progress, deviation, fault = self.check_state((x, y, z))
         if fault:
-            return ControlResult(0.0, 0.0, z, progress, deviation, fault=fault)
+            return ControlResult(0.0, 0.0, z, progress, deviation,
+                                 fault=fault, sample_period=self.dt,
+                                 solver_status="safety-stop")
 
         references, holding = self._references_from_progress(elapsed, deviation)
         q = self._objective_vector(x, y, vx, vy, references)
-        self._solver.update(q=q)
+        lower, upper = self._dynamic_command_bounds()
+        self._solver.update(q=q, l=lower, u=upper)
         solution = self._solver.solve()
         if solution.info.status_val not in (1, 2) or solution.x is None:
             command = (np.zeros(2, dtype=float) if holding else
                        self._forward_recovery_command((x, y), deviation))
+            command = self._limit_command_change(command)
             self._previous_command = command
+            reference = references[0]
             return ControlResult(
-                float(command[0]), float(command[1]), references[0].z,
+                float(command[0]), float(command[1]), reference.z,
                 progress, deviation,
                 warning="预测控制器本拍未能及时求解，使用沿线前进控制继续巡航",
+                reference_x=reference.x,
+                reference_y=reference.y,
+                reference_z=reference.z,
+                reference_distance=reference.distance,
+                sample_period=self.dt,
+                solver_status=solution.info.status,
+                waypoint_passages=self._last_waypoint_passages,
             )
 
         command = np.asarray(solution.x[:2], dtype=float)
         magnitude = float(np.linalg.norm(command))
         if magnitude > self.limits.max_speed:
             command *= self.limits.max_speed / magnitude
+        command = self._limit_command_change(command)
         if not holding and deviation > 0.25:
             command = self._enforce_forward_recovery(command, progress)
         self._previous_command = command
@@ -136,17 +178,27 @@ class PredictivePathController:
             and abs(float(position[2]) - final.z) <= 0.25
             and math.hypot(vx, vy) <= 0.35
         )
+        reference = references[0]
         return ControlResult(
-            float(command[0]), float(command[1]), references[0].z,
+            float(command[0]), float(command[1]), reference.z,
             progress, deviation, finished=finished, warning=self._last_warning,
+            reference_x=reference.x,
+            reference_y=reference.y,
+            reference_z=reference.z,
+            reference_distance=reference.distance,
+            sample_period=self.dt,
+            solver_status=solution.info.status,
+            waypoint_passages=self._last_waypoint_passages,
         )
 
     def _check_waypoint_passage(self, position, previous_progress, progress):
         """按顺序核对航点；漏点只告警并向前推进，不反向追赶。"""
         warnings = []
+        passages = []
         while self._next_waypoint < len(self.trajectory.waypoint_distances):
             target_distance = self.trajectory.waypoint_distances[self._next_waypoint]
             if progress < target_distance:
+                self._last_waypoint_passages = tuple(passages)
                 return "；".join(warnings)
             target = self._sample_at_distance(target_distance).position
             previous = self._previous_position or position
@@ -163,7 +215,9 @@ class PredictivePathController:
                     "第 %d 个航点经过误差 %.2f m；不回头，继续前飞并回归后续航线"
                     % (self._next_waypoint + 1, error)
                 )
+            passages.append((self._next_waypoint, error))
             self._next_waypoint += 1
+        self._last_waypoint_passages = tuple(passages)
         return "；".join(warnings)
 
     def _project_progress(self, x, y, z):
@@ -243,6 +297,10 @@ class PredictivePathController:
             )
             scheduled_speed = max(scheduled_speed, 0.5 * next_speed)
             scheduled_speed *= recovery_scale
+            scheduled_speed = min(
+                scheduled_speed,
+                self._waypoint_approach_speed_cap(reference_distance),
+            )
             reference_distance = min(total_distance, reference_distance + scheduled_speed * self.dt)
             sample = self._sample_at_distance(reference_distance)
             references.append(replace(
@@ -252,6 +310,21 @@ class PredictivePathController:
                 vz=sample.vz * recovery_scale,
             ))
         return references, False
+
+    def _waypoint_approach_speed_cap(self, progress):
+        """根据实测制动能力提前减速，为航点位置修正留出空间。"""
+        if self._next_waypoint >= len(self.trajectory.waypoint_distances):
+            return self.limits.max_speed
+        remaining = self.trajectory.waypoint_distances[self._next_waypoint] - progress
+        if remaining <= 0.0:
+            return self.limits.max_speed
+        delay = self.limits.response_time + self.limits.command_delay
+        braking = self.limits.max_braking
+        usable_distance = max(0.0, remaining - 0.10)
+        delayed = braking * delay
+        cap = math.sqrt(delayed * delayed + 2.0 * braking * usable_distance) - delayed
+        # 保持小幅正向速度通过航点，不在容差边缘悬停或倒飞。
+        return min(self.limits.max_speed, max(0.20, cap))
 
     def _is_holding_at(self, timed_sample, elapsed, progress):
         """只有任务确实处于航点悬停窗口时才继续按时间参考保持静止。"""
@@ -358,9 +431,9 @@ class PredictivePathController:
                 col = command_index * 2
                 prediction[row:row + 2, col:col + 2] = coefficient * np.eye(2)
 
-        position_weight = 12.0
-        speed_weight = 0.25
-        smooth_weight = 2.5
+        position_weight = self.position_weight
+        speed_weight = self.speed_weight
+        smooth_weight = self.smooth_weight
         hessian = 2.0 * position_weight * prediction.T @ prediction
         hessian += 2.0 * speed_weight * np.eye(variables)
         for step in range(horizon):
@@ -373,16 +446,29 @@ class PredictivePathController:
 
         constraint_rows = []
         angles = [index * math.pi / 4.0 for index in range(8)]
+        normals = [(math.cos(angle), math.sin(angle)) for angle in angles]
         for step in range(horizon):
-            for angle in angles:
+            for normal in normals:
                 row = np.zeros(variables)
-                row[step * 2] = math.cos(angle)
-                row[step * 2 + 1] = math.sin(angle)
+                row[step * 2] = normal[0]
+                row[step * 2 + 1] = normal[1]
+                constraint_rows.append(row)
+        velocity_constraint_count = len(constraint_rows)
+        for step in range(horizon):
+            for normal in normals:
+                row = np.zeros(variables)
+                row[step * 2] = normal[0]
+                row[step * 2 + 1] = normal[1]
+                if step:
+                    row[(step - 1) * 2] = -normal[0]
+                    row[(step - 1) * 2 + 1] = -normal[1]
                 constraint_rows.append(row)
         constraint = np.asarray(constraint_rows)
         cap = self.limits.max_speed * math.cos(math.pi / 8.0)
         lower = np.full(constraint.shape[0], -np.inf)
         upper = np.full(constraint.shape[0], cap)
+        lower[velocity_constraint_count:] = -self.limits.max_braking * self.dt
+        upper[velocity_constraint_count:] = self.limits.max_acceleration * self.dt
 
         solver = osqp.OSQP()
         solver.setup(
@@ -401,10 +487,44 @@ class PredictivePathController:
             time_limit=0.035,
         )
         return solver, (prediction, free_motion, position_weight, speed_weight,
-                        smooth_weight, alpha)
+                        smooth_weight, alpha, velocity_constraint_count, normals)
+
+    def _dynamic_command_bounds(self):
+        """按测得的加减速能力限制预测窗内相邻速度指令的变化。"""
+        velocity_count, normals = self._control_matrix[-2:]
+        row_count = velocity_count + self.horizon * len(normals)
+        lower = np.full(row_count, -np.inf)
+        upper = np.full(
+            row_count,
+            self.limits.max_speed * math.cos(math.pi / 8.0),
+        )
+        for step in range(self.horizon):
+            for index, normal in enumerate(normals):
+                row = velocity_count + step * len(normals) + index
+                if step == 0:
+                    previous = float(np.dot(normal, self._previous_command))
+                    lower[row] = previous - self.limits.max_braking * self.dt
+                    upper[row] = previous + self.limits.max_acceleration * self.dt
+                else:
+                    lower[row] = -self.limits.max_braking * self.dt
+                    upper[row] = self.limits.max_acceleration * self.dt
+        return lower, upper
+
+    def _limit_command_change(self, command):
+        """给求解失败后的替代指令也加上相同的加减速保护。"""
+        command = np.asarray(command, dtype=float)
+        delta = command - self._previous_command
+        magnitude = float(np.linalg.norm(delta))
+        rate = (self.limits.max_acceleration
+                if magnitude == 0.0 or np.linalg.norm(command) >= np.linalg.norm(self._previous_command)
+                else self.limits.max_braking)
+        limit = rate * self.dt
+        if magnitude > limit > 0.0:
+            delta *= limit / magnitude
+        return self._previous_command + delta
 
     def _objective_vector(self, x, y, vx, vy, references):
-        prediction, free_motion, position_weight, speed_weight, smooth_weight, _ = self._control_matrix
+        prediction, free_motion, position_weight, speed_weight, smooth_weight, _ = self._control_matrix[:6]
         variables = self.horizon * 2
         reference_positions = np.empty(self.horizon * 2, dtype=float)
         reference_velocities = np.empty(variables, dtype=float)
