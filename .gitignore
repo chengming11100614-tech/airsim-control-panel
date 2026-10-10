@@ -1,0 +1,28 @@
+# Python bytecode and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# AirSim runtime settings and secrets
+.env
+.env.*
+!.env.example
+settings.json
+**/*.pem
+**/*.key
+**/*secret*
+
+# Flight data and generated outputs
+logs/
+**/logs/
+*.csv
+*.log
+*.png
+*.pdf
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

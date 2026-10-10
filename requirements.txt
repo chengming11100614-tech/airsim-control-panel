@@ -1,0 +1,5 @@
+# Tested with Python 3.10 on Windows.
+numpy==1.26.4
+airsim==1.8.1
+scipy>=1.10,<2
+osqp>=0.6,<2
