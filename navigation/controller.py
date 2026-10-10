@@ -391,7 +391,8 @@ class CarrotPathController:
     def _final_braking_cap(self, progress):
         """把响应延迟计入末点制动，防止速度曲线误差导致明显冲过终点。"""
         target_distance = self.trajectory.waypoint_distances[-1]
-        remaining = max(0.0, target_distance - progress - 0.10)
+        # 末点前留出 0.18 m 额外制动距离；落停后仍留在 0.25 m 完成半径内。
+        remaining = max(0.0, target_distance - progress - 0.18)
         delay = (max(self.limits.response_time, self.limits.velocity_time_constant)
                  + self.limits.command_delay)
         delayed_distance = self.limits.max_braking * delay

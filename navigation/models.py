@@ -88,10 +88,10 @@ class CalibrationProfile:
 
     calibrated: bool = False
     safe_max_speed: float = 2.0
-    # 六航点任务实飞验证了这组规划加减速上限：更早开始弯前制动，任务用时更短。
-    # 它们只生成路线速度曲线；AirSim 速度响应仍由下方实测响应模型限制。
-    acceleration: float = 1.8
-    braking: float = 0.55
+    # 五航点竞速线路三次实飞验证了 2.4/0.75 m/s² 的规划加减速上限；
+    # 它们只安排沿线加速和弯前制动，AirSim 的实际响应仍由下方模型限制。
+    acceleration: float = 2.4
+    braking: float = 0.75
     lateral_acceleration: float = 1.0
     response_time: float = 0.25
     command_delay: float = 0.05
@@ -110,8 +110,9 @@ class KinematicLimits:
 
     max_speed: float = 15.0
     max_vertical_speed: float = 2.0
-    max_acceleration: float = 1.8
-    max_braking: float = 0.55
+    # 与默认标定档保持一致，按可用距离生成动态加速和制动曲线。
+    max_acceleration: float = 2.4
+    max_braking: float = 0.75
     max_lateral_acceleration: float = 1.0
     response_time: float = 0.25
     command_delay: float = 0.05

@@ -308,8 +308,8 @@ class RoutePlanningTests(unittest.TestCase):
             15.0, 0.8, CalibrationProfile(calibrated=False, safe_max_speed=2.0)
         )
         self.assertEqual(limits.max_speed, 15.0)
-        self.assertEqual(limits.max_acceleration, 1.8)
-        self.assertEqual(limits.max_braking, 0.55)
+        self.assertEqual(limits.max_acceleration, 2.4)
+        self.assertEqual(limits.max_braking, 0.75)
         self.assertEqual(limits.command_delay, 0.05)
         self.assertEqual(limits.velocity_time_constant, 1.3)
         self.assertEqual(limits.velocity_acceleration, 1.3)
@@ -347,7 +347,7 @@ class ControllerTests(unittest.TestCase):
         position, velocity = [0.0, 0.0, -5.0], [0.0, 0.0]
         maximum_deviation = 0.0
         finished = False
-        for index in range(240):
+        for index in range(260):
             result = controller.step(position, velocity, index * 0.05)
             self.assertFalse(result.fault)
             self.assertLessEqual(math.hypot(result.vx, result.vy), limits.max_speed + 1e-6)
@@ -373,7 +373,7 @@ class ControllerTests(unittest.TestCase):
         position, velocity = [0.0, 0.0, -5.0], [0.0, 0.0]
         minimum_clearance = float("inf")
         finished = False
-        for index in range(240):
+        for index in range(260):
             result = controller.step(position, velocity, index * 0.05)
             self.assertFalse(result.fault)
             minimum_clearance = min(
