@@ -80,6 +80,11 @@ def time_parameterize(
         waypoint = waypoints[waypoint_index]
         if waypoint.hold > 0.0 or _sharp_turn(positions, sample_index):
             stop_indices.add(sample_index)
+    for stop_distance in curve.stop_distances:
+        stop_indices.add(min(
+            range(count),
+            key=lambda index: abs(distances[index] - stop_distance),
+        ))
     for index in stop_indices:
         speed_cap[index] = 0.0
 

@@ -10,7 +10,7 @@ import math
 from typing import Sequence, Tuple
 
 import numpy as np
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import BPoly, CubicSpline
 
 from .geometry import InflatedCircle
 
@@ -23,6 +23,8 @@ class CurveSamples:
     distances: Tuple[float, ...]
     curvatures: Tuple[float, ...]
     waypoint_distances: Tuple[float, ...]
+    # 必须在这些弧长位置停下的折线转向点；用于平直候选的安全接入失败时。
+    stop_distances: Tuple[float, ...] = ()
 
 
 def fit_safe_curve(
@@ -30,8 +32,13 @@ def fit_safe_curve(
     waypoint_anchor_indices: Sequence[int],
     protected_circles: Sequence[InflatedCircle],
     sample_spacing: float = 0.10,
+    preserve_straight_leg: int = -1,
 ) -> CurveSamples:
-    """拟合经过所有航点的 C2 曲线；无法证明避障时返回 None。"""
+    """拟合经过所有航点的 C2 曲线；无法证明避障时返回 None。
+
+    preserve_straight_leg 指定按顺序编号的航点段（0 表示起点到第一个航点）。
+    对该段在两端约束直线切向和零曲率，使前后曲线平滑接入后，段内仍保持直线。
+    """
     points = _remove_consecutive_duplicates(route_points)
     if not points:
         raise ValueError("规划路线没有位置点")
@@ -51,7 +58,35 @@ def fit_safe_curve(
     if parameter[-1] <= 1e-8:
         raise ValueError("路线长度接近零，无法拟合曲线")
     values = np.asarray(points, dtype=float)
-    spline = CubicSpline(parameter, values, axis=0, bc_type="natural")
+    baseline = CubicSpline(parameter, values, axis=0, bc_type="natural")
+    first_derivatives = np.asarray(baseline(parameter, 1), dtype=float)
+    second_derivatives = np.asarray(baseline(parameter, 2), dtype=float)
+
+    if preserve_straight_leg >= 0:
+        if preserve_straight_leg >= len(waypoint_anchor_indices):
+            raise ValueError("直线候选的航点段编号无效")
+        first_index = (0 if preserve_straight_leg == 0
+                       else waypoint_anchor_indices[preserve_straight_leg - 1])
+        last_index = waypoint_anchor_indices[preserve_straight_leg]
+        if last_index != first_index + 1:
+            raise ValueError("指定的航点段不是无遮挡直线候选")
+        delta = values[last_index] - values[first_index]
+        length = float(np.linalg.norm(delta))
+        if length <= 1e-8:
+            raise ValueError("直线候选长度接近零")
+        direction = delta / length
+        first_derivatives[first_index] = direction
+        first_derivatives[last_index] = direction
+        second_derivatives[first_index] = 0.0
+        second_derivatives[last_index] = 0.0
+
+    # 每个结点给出位置、一阶和二阶导数。没有改约束的区间仍严格等于原三次样条；
+    # 直线候选区间则由两端相同切向和零曲率约束成精确直线。
+    derivatives = [
+        [values[index], first_derivatives[index], second_derivatives[index]]
+        for index in range(len(parameter))
+    ]
+    spline = BPoly.from_derivatives(parameter, derivatives, extrapolate=False)
 
     # 每个原始节点都是样条结点，故曲线会精确通过用户航点。
     if not _spline_is_clear(spline, parameter, protected_circles):
@@ -89,18 +124,89 @@ def fit_safe_curve(
     return CurveSamples(positions, tuple(distance), tuple(curvature), waypoint_distances)
 
 
+def splice_straight_leg(
+    route_points: Sequence[Tuple[float, float, float]],
+    waypoint_anchor_indices: Sequence[int],
+    curve: CurveSamples,
+    leg_index: int,
+    sample_spacing: float = 0.10,
+) -> CurveSamples:
+    """把已验证曲线的一段替换为已通过可见性检查的直线，并在折角处停车。
+
+    该候选用于平滑切向约束会碰到障碍物时。替换范围之外沿用已认证曲线，
+    新线段的端点作为航点，并在需要改变方向的位置加入停车弧长。
+    """
+    if leg_index < 0 or leg_index >= len(waypoint_anchor_indices):
+        raise ValueError("直线候选的航点段编号无效")
+    if sample_spacing <= 0.0:
+        raise ValueError("曲线采样间距必须大于零")
+
+    first_index = (0 if leg_index == 0
+                   else waypoint_anchor_indices[leg_index - 1])
+    last_index = waypoint_anchor_indices[leg_index]
+    if last_index != first_index + 1:
+        raise ValueError("指定的航点段不是无遮挡直线候选")
+
+    start_distance = (0.0 if leg_index == 0
+                      else curve.waypoint_distances[leg_index - 1])
+    end_distance = curve.waypoint_distances[leg_index]
+    start = tuple(float(value) for value in route_points[first_index])
+    end = tuple(float(value) for value in route_points[last_index])
+    line_length = math.dist(start, end)
+    if line_length <= 1e-8:
+        raise ValueError("直线候选长度接近零")
+
+    prefix = [index for index, value in enumerate(curve.distances)
+              if value <= start_distance + 1e-7]
+    suffix = [index for index, value in enumerate(curve.distances)
+              if value > end_distance + 1e-7]
+    if not prefix or not suffix and end_distance < curve.distances[-1] - 1e-7:
+        raise ValueError("无法在曲线上定位直线候选的端点")
+
+    positions = [curve.positions[index] for index in prefix]
+    curvatures = [curve.curvatures[index] for index in prefix]
+    pieces = max(1, int(math.ceil(line_length / sample_spacing)))
+    for piece in range(1, pieces + 1):
+        fraction = piece / pieces
+        positions.append(tuple(a + fraction * (b - a) for a, b in zip(start, end)))
+        curvatures.append(0.0)
+    for index in suffix:
+        positions.append(curve.positions[index])
+        curvatures.append(curve.curvatures[index])
+
+    distances = [0.0]
+    for first, second in zip(positions, positions[1:]):
+        distances.append(distances[-1] + math.dist(first, second))
+    new_start_distance = distances[len(prefix) - 1]
+    new_end_distance = new_start_distance + line_length
+    shift = line_length - (end_distance - start_distance)
+    waypoint_distances = tuple(
+        value if index < leg_index else value + shift
+        for index, value in enumerate(curve.waypoint_distances)
+    )
+
+    stop_distances = []
+    if leg_index > 0:
+        stop_distances.append(new_start_distance)
+    if leg_index + 1 < len(waypoint_anchor_indices):
+        stop_distances.append(new_end_distance)
+
+    return CurveSamples(
+        positions=tuple(positions),
+        distances=tuple(distances),
+        curvatures=tuple(curvatures),
+        waypoint_distances=waypoint_distances,
+        stop_distances=tuple(stop_distances),
+    )
+
+
 def _spline_is_clear(spline, parameter, circles):
     """通过每个样条区间的 Bézier 凸包递归验证整段曲线。"""
     for interval in range(len(parameter) - 1):
         u0, u1 = float(parameter[interval]), float(parameter[interval + 1])
         width = u1 - u0
-        # scipy CubicSpline 的多项式按区间局部变量展开，转换为等价 Bézier 控制点。
-        coeff = spline.c[:, interval, :2]
-        p0 = coeff[3]
-        p1 = coeff[3] + coeff[2] * width / 3.0
-        p2 = coeff[3] + 2.0 * coeff[2] * width / 3.0 + coeff[1] * width * width / 3.0
-        p3 = coeff[3] + coeff[2] * width + coeff[1] * width * width + coeff[0] * width ** 3
-        control = np.asarray((p0, p1, p2, p3), dtype=float)
+        # BPoly 系数本身就是 Bézier 控制点，可直接用凸包性质证明整段安全。
+        control = np.asarray(spline.c[:, interval, :2], dtype=float)
         for circle in circles:
             if not _bezier_clear(control, (circle.x, circle.y), circle.radius, 0):
                 return False
@@ -119,15 +225,13 @@ def _bezier_clear(control, center, radius, depth):
 
 
 def _split_bezier(control):
-    """在参数 0.5 处用 de Casteljau 算法精确二分 Bézier 曲线。"""
-    p01 = (control[0] + control[1]) * 0.5
-    p12 = (control[1] + control[2]) * 0.5
-    p23 = (control[2] + control[3]) * 0.5
-    p012 = (p01 + p12) * 0.5
-    p123 = (p12 + p23) * 0.5
-    middle = (p012 + p123) * 0.5
-    return (np.asarray((control[0], p01, p012, middle)),
-            np.asarray((middle, p123, p23, control[3])))
+    """在参数 0.5 处用 de Casteljau 算法精确二分任意阶 Bézier 曲线。"""
+    level = [np.asarray(control, dtype=float)]
+    while len(level[-1]) > 1:
+        level.append((level[-1][:-1] + level[-1][1:]) * 0.5)
+    left = np.asarray([row[0] for row in level])
+    right = np.asarray([row[-1] for row in reversed(level)])
+    return left, right
 
 
 def _hull_distance(points, center):
