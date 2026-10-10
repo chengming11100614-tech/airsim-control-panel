@@ -50,7 +50,6 @@ class PredictivePathController:
         self.max_cross_track = max_cross_track
         self._times = [sample.time for sample in trajectory.samples]
         self._progress_distance = 0.0
-        self._previous_progress = 0.0
         self._previous_position = None
         self._next_waypoint = 0
         self._previous_command = np.zeros(2, dtype=float)
@@ -84,7 +83,6 @@ class PredictivePathController:
         )
         if waypoint_fault:
             return self._progress_distance, deviation, waypoint_fault
-        self._previous_progress = self._progress_distance
         self._previous_position = (x, y, z)
         return self._progress_distance, deviation, ""
 
@@ -276,15 +274,7 @@ class PredictivePathController:
         q -= 2.0 * speed_weight * reference_velocities
 
         previous = self._previous_command
-        for index in range(self.horizon):
-            for axis in range(2):
-                current = index * 2 + axis
-                if index == 0:
-                    q[current] -= 2.0 * smooth_weight * previous[axis]
-                else:
-                    before = (index - 1) * 2 + axis
-                    q[current] -= 2.0 * smooth_weight * 0.0
-                    q[before] += 2.0 * smooth_weight * 0.0
+        q[:2] -= 2.0 * smooth_weight * previous
         return q
 
 
