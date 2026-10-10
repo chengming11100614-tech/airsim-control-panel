@@ -10,6 +10,7 @@ venv/
 .env.*
 !.env.example
 settings.json
+calibration.json
 **/*.pem
 **/*.key
 **/*secret*

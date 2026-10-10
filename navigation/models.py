@@ -5,6 +5,7 @@
 """
 
 from dataclasses import dataclass
+import math
 from typing import Optional, Tuple
 
 
@@ -21,11 +22,28 @@ class CircleObstacle:
     name: str = ""
 
     def __post_init__(self):
+        if not all(math.isfinite(float(value)) for value in (self.x, self.y, self.radius)):
+            raise ValueError("障碍物位置和半径必须是有限数值")
         if self.radius < 0.0:
             raise ValueError("障碍物半径不能为负数")
 
+    @property
+    def r(self) -> float:
+        """障碍物地图上使用的半径简称。"""
+        return self.radius
 
-@dataclass(frozen=True)
+    def to_dict(self):
+        """保存成兼容旧航线文件的圆柱字段。"""
+        return {"x": self.x, "y": self.y, "r": self.radius, "name": self.name}
+
+    @classmethod
+    def from_dict(cls, data):
+        """读取旧文件中的 r 字段或新文件中的 radius 字段。"""
+        return cls(data["x"], data["y"], data.get("radius", data.get("r")),
+                   data.get("name", ""))
+
+
+@dataclass
 class Waypoint:
     """必须按输入顺序经过的航点。
 
@@ -39,6 +57,8 @@ class Waypoint:
     hold: float = 0.0
 
     def __post_init__(self):
+        if not all(math.isfinite(float(value)) for value in (self.x, self.y, self.z, self.hold)):
+            raise ValueError("航点位置和悬停时间必须是有限数值")
         if self.hold < 0.0:
             raise ValueError("航点悬停时间不能为负数")
 
@@ -46,6 +66,20 @@ class Waypoint:
     def position(self) -> Vector3:
         """返回 AirSim NED 下的三维位置。"""
         return (self.x, self.y, self.z)
+
+    @property
+    def altitude(self) -> float:
+        """返回界面使用的正向高度值。"""
+        return -self.z
+
+    def to_dict(self):
+        """保存位置和悬停时长；不会再写入无效的每点速度。"""
+        return {"x": self.x, "y": self.y, "z": self.z, "hold": self.hold}
+
+    @classmethod
+    def from_dict(cls, data):
+        """读取航点；旧文件中的 speed 字段被忽略。"""
+        return cls(data["x"], data["y"], data["z"], data.get("hold", 0.0))
 
 
 @dataclass(frozen=True)

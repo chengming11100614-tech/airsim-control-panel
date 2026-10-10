@@ -28,11 +28,17 @@ import queue
 import threading
 import time
 import tkinter as tk
+from dataclasses import asdict
 from tkinter import filedialog, messagebox, ttk
 
-from planner.route_planner import (Obstacle, Waypoint, cumulative_lengths,
-                                   demo_obstacles, demo_waypoints,
-                                   deviation_to_path, plan_route)
+from navigation.demo import demo_obstacles, demo_waypoints
+from navigation.telemetry import deviation_to_path
+from navigation.calibration import (SPEED_STEPS, CalibrationSample,
+                                    analyze_calibration)
+from navigation.controller import PredictivePathController
+from navigation.geometry import InflatedCircle, segment_clear
+from navigation.models import CalibrationProfile, CircleObstacle, KinematicLimits, Waypoint
+from navigation.planner import PlanningError, plan_ordered_route
 
 try:
     import airsim
@@ -68,7 +74,7 @@ FONT_L  = ("Microsoft YaHei UI", 11, "bold")
 FONT_XL = ("Consolas", 20, "bold")
 
 DEFAULT_ALT = 5.0        # 默认巡航高度（离地，米）
-DEFAULT_SPD = 2.0        # 默认巡航速度（米每秒）
+DEFAULT_SPD = 15.0       # 全局最高允许速度；未标定时规划器仍限制为 2 m/s
 POSITION_EPS = 0.6       # 到点判定容差（米）
 DEV_WARN = 3.0           # 手动模式偏差告警阈值（米）
 
@@ -114,7 +120,8 @@ class FlightRecorder:
     """
 
     FIELDS = ["t", "x", "y", "z", "alt", "vx", "vy", "vz",
-              "roll", "pitch", "yaw", "dev", "wp", "mode"]
+              "roll", "pitch", "yaw", "dev", "wp", "wp_error",
+              "obs_clearance", "sway_count", "flight_elapsed", "mode"]
 
     def __init__(self, out_dir=None):
         self.out_dir = out_dir or os.path.join(
@@ -223,12 +230,19 @@ class GCSApp:
         self.flying = False
         self.mode = "未连接"
         self.waypoints = []          # [Waypoint, ...]
-        self.obstacles = []          # [Obstacle, ...]
+        self.obstacles = []          # [CircleObstacle, ...]
         self.route = []              # 规划后的稀疏航线 [(x, y, z), ...]
         self.route_xy = []           # 同上，只留 XY，算偏差用
         self.route_cum = []
-        self.route_dense = []        # A* 原始路径，画在地图上对比
         self.info = {}
+        self.trajectory = None
+        self.plan_limits = None
+        self.plan_start = None
+        self.map_revision = 0
+        self.route_revision = -1
+        self._cruise_active = False
+        self._calibrating = False
+        self.calibration_profile = self._load_calibration_profile()
         self.home = None             # 起飞点 NED
         self.cruise_index = -1       # 当前正在飞的航点序号
         self.telem = {}
@@ -258,6 +272,13 @@ class GCSApp:
         self._runner_on = True
         self._telem_on = True
         self._last_dev_warn = 0.0
+        self._last_collision_check = 0.0
+        self._sway_count = 0
+        self._sway_side = 0
+        self._max_waypoint_error = 0.0
+        self._cruise_deviations = []
+        self._minimum_cruise_clearance = float("inf")
+        self._cruise_elapsed = 0.0
         self.recorder = None
 
         self._build_style()
@@ -390,16 +411,11 @@ class GCSApp:
 
         self.var_show_route = tk.BooleanVar(value=True)
         self.var_show_trail = tk.BooleanVar(value=True)
-        self.var_show_dense = tk.BooleanVar(value=False)
         tk.Checkbutton(mbar, text="规划航线", variable=self.var_show_route,
                        bg=PANEL, fg=TEXT, selectcolor=PANEL2, activebackground=PANEL,
                        activeforeground=ACCENT, font=FONT_S, bd=0,
                        highlightthickness=0, cursor="hand2").pack(side="right", padx=6)
         tk.Checkbutton(mbar, text="实际轨迹", variable=self.var_show_trail,
-                       bg=PANEL, fg=TEXT, selectcolor=PANEL2, activebackground=PANEL,
-                       activeforeground=ACCENT, font=FONT_S, bd=0,
-                       highlightthickness=0, cursor="hand2").pack(side="right", padx=6)
-        tk.Checkbutton(mbar, text="A* 原始路径", variable=self.var_show_dense,
                        bg=PANEL, fg=TEXT, selectcolor=PANEL2, activebackground=PANEL,
                        activeforeground=ACCENT, font=FONT_S, bd=0,
                        highlightthickness=0, cursor="hand2").pack(side="right", padx=6)
@@ -455,10 +471,10 @@ class GCSApp:
         f = tk.Frame(nb, bg=PANEL)
         nb.add(f, text="  航点  ")
 
-        self.wp_tree = ttk.Treeview(f, columns=("i", "x", "y", "alt", "spd", "hold"),
+        self.wp_tree = ttk.Treeview(f, columns=("i", "x", "y", "alt", "hold"),
                                     show="headings", height=7, selectmode="browse")
-        for col, txt, w in (("i", "#", 30), ("x", "X北 m", 60), ("y", "Y东 m", 60),
-                            ("alt", "高度 m", 60), ("spd", "速度", 50), ("hold", "悬停 s", 55)):
+        for col, txt, w in (("i", "#", 30), ("x", "X北 m", 65), ("y", "Y东 m", 65),
+                            ("alt", "高度 m", 65), ("hold", "悬停 s", 65)):
             self.wp_tree.heading(col, text=txt)
             self.wp_tree.column(col, width=w, anchor="center")
         self.wp_tree.pack(fill="both", expand=True, padx=6, pady=(6, 4))
@@ -470,7 +486,7 @@ class GCSApp:
         self.wp_vars = {}
         for key, txt, dflt in (("x", "X北", "0"), ("y", "Y东", "0"),
                                ("alt", "高度", str(DEFAULT_ALT)),
-                               ("spd", "速度", str(DEFAULT_SPD)), ("hold", "悬停", "0")):
+                               ("hold", "悬停", "0")):
             cell = tk.Frame(form, bg=PANEL)
             cell.pack(side="left", padx=(0, 5))
             self._label(cell, txt, MUTED, FONT_S).pack(anchor="w")
@@ -507,7 +523,7 @@ class GCSApp:
         f = tk.Frame(nb, bg=PANEL)
         nb.add(f, text="  规划  ")
 
-        self._label(f, "障碍物（圆柱，XY 平面）", TEXT, FONT_B).pack(anchor="w", padx=8, pady=(8, 2))
+        self._label(f, "障碍物（竖直圆柱，XY 平面）", TEXT, FONT_B).pack(anchor="w", padx=8, pady=(8, 2))
         self.obs_tree = ttk.Treeview(f, columns=("i", "x", "y", "r"),
                                      show="headings", height=5, selectmode="browse")
         for col, txt, w in (("i", "#", 30), ("x", "X北 m", 70), ("y", "Y东 m", 70),
@@ -523,12 +539,11 @@ class GCSApp:
 
         par = tk.Frame(f, bg=PANEL)
         par.pack(fill="x", padx=8, pady=(2, 6))
-        self._label(par, "栅格边长 m", MUTED, FONT_S).grid(row=0, column=0, sticky="w")
-        self.var_res = tk.StringVar(value="0.5")
-        self._entry_var(par, self.var_res, 5).grid(row=1, column=0, padx=(0, 10))
-        self._label(par, "安全间距 m", MUTED, FONT_S).grid(row=0, column=1, sticky="w")
+        self._label(par, "障碍边缘至飞机中心的安全间距 m", MUTED, FONT_S).grid(
+            row=0, column=0, sticky="w")
         self.var_clr = tk.StringVar(value="0.8")
-        self._entry_var(par, self.var_clr, 5).grid(row=1, column=1)
+        self._entry_var(par, self.var_clr, 5).grid(row=1, column=0, sticky="w")
+        self.var_clr.trace_add("write", lambda *_: self._invalidate_route())
 
         pb = tk.Frame(f, bg=PANEL)
         pb.pack(fill="x", padx=6, pady=(4, 6))
@@ -540,6 +555,8 @@ class GCSApp:
         self.lbl_plan = self._label(f, "尚未规划。地图上点几个航点，再按「规划航线」。",
                                     MUTED, FONT_S, justify="left", wraplength=350)
         self.lbl_plan.pack(anchor="w", padx=8, pady=(0, 6))
+        self.btn_calibrate = self._btn(f, "安全直线速度标定", self.on_calibrate, width=18)
+        self.btn_calibrate.pack(anchor="w", padx=8, pady=(0, 8))
 
     # -----------------------------------------------------------------------
     # Tab 3：手动操控
@@ -596,17 +613,11 @@ class GCSApp:
         self._label(par, "巡航高度 m").pack(side="left")
         self.var_alt = tk.StringVar(value=str(DEFAULT_ALT))
         self._entry_var(par, self.var_alt, 5).pack(side="left", padx=(4, 12))
-        self._label(par, "巡航速度 m/s").pack(side="left")
+        self.var_alt.trace_add("write", lambda *_: self._invalidate_route())
+        self._label(par, "最高速度上限 m/s").pack(side="left")
         self.var_speed = tk.StringVar(value=str(DEFAULT_SPD))
         self._entry_var(par, self.var_speed, 5).pack(side="left", padx=4)
-
-        self.var_use_path = tk.BooleanVar(value=False)
-        tk.Checkbutton(f, text="整段用 moveOnPathAsync 飞（任务书演示模式）",
-                       variable=self.var_use_path, bg=PANEL, fg=MUTED,
-                       selectcolor=PANEL2, activebackground=PANEL,
-                       activeforeground=ACCENT, font=FONT_S, bd=0,
-                       highlightthickness=0, cursor="hand2"
-                       ).pack(anchor="w", padx=2)
+        self.var_speed.trace_add("write", lambda *_: self._invalidate_route())
 
         g = tk.Frame(f, bg=PANEL)
         g.pack(fill="x", pady=6)
@@ -694,6 +705,7 @@ class GCSApp:
                 "vx": k.linear_velocity.x_val,
                 "vy": k.linear_velocity.y_val,
                 "vz": k.linear_velocity.z_val,
+                "monotonic": time.monotonic(),
                 "roll": round(math.degrees(roll), 2),
                 "pitch": round(math.degrees(pitch), 2),
                 "yaw": round(math.degrees(yaw), 2),
@@ -710,6 +722,35 @@ class GCSApp:
         row["dev"] = round(dev["dist"], 3)
         row["progress"] = dev["progress"]
         row["wp"] = self.cruise_index
+        obstacle_clearance = min(
+            (math.hypot(x - obstacle.x, y - obstacle.y) - obstacle.r
+             for obstacle in tuple(self.obstacles)),
+            default=float("inf"),
+        )
+        row["obs_clearance"] = round(obstacle_clearance, 3)
+        waypoint_error = 0.0
+        if 0 <= self.cruise_index < len(self.waypoints):
+            waypoint_error = math.dist(
+                (x, y, z),
+                (self.waypoints[self.cruise_index].x,
+                 self.waypoints[self.cruise_index].y,
+                 self.waypoints[self.cruise_index].z),
+            )
+        row["wp_error"] = round(waypoint_error, 3)
+        if self._cruise_active:
+            self._cruise_deviations.append(dev["dist"])
+            self._minimum_cruise_clearance = min(
+                self._minimum_cruise_clearance, obstacle_clearance
+            )
+            waypoint_index = self.cruise_index
+            if (self.trajectory is not None
+                    and 0 <= waypoint_index < len(self.trajectory.waypoint_distances)
+                    and abs(dev.get("s", 0.0)
+                            - self.trajectory.waypoint_distances[waypoint_index]) <= 1.0):
+                self._max_waypoint_error = max(self._max_waypoint_error, waypoint_error)
+            self._update_sway_count(dev)
+        row["sway_count"] = self._sway_count
+        row["flight_elapsed"] = self._cruise_elapsed
 
         with self._lock:
             self.telem = row
@@ -731,14 +772,50 @@ class GCSApp:
                           % (dev["dist"], DEV_WARN, dev["side"] or "中"), "warn")
 
         # 碰撞检测：约每 0.5 秒查一次
-        if int(time.time() * 2) % 10 == 0:
+        now = time.monotonic()
+        if now - self._last_collision_check >= 0.5:
+            self._last_collision_check = now
             try:
                 c = self.client.simGetCollisionInfo(vehicle_name="")
                 if c.has_collided:
+                    if self._cruise_active or self._calibrating:
+                        self.stop_evt.set()
                     self.ui_q.put(("collision", c.object_name))
             except Exception:
                 pass
         time.sleep(0.05)
+
+    def _update_sway_count(self, deviation):
+        """只在局部近直线段统计横向误差左右换边次数。"""
+        path = self.route_xy
+        if len(path) < 3 or not self._route_segment_is_straight(deviation.get("seg", 0)):
+            self._sway_side = 0
+            return
+        side = -1 if deviation["side"] == "左" else (1 if deviation["side"] == "右" else 0)
+        if deviation["dist"] < 0.03:
+            side = 0
+        if side and self._sway_side and side != self._sway_side:
+            self._sway_count += 1
+        self._sway_side = side
+
+    def _route_segment_is_straight(self, segment):
+        """比较航线约 1 m 前后的方向，排除正常弯道中的左右切换。"""
+        path = self.route_xy
+        segment = max(0, min(len(path) - 2, int(segment)))
+        before_index = max(0, segment - 10)
+        after_index = min(len(path) - 1, segment + 10)
+        if after_index - before_index < 2:
+            return False
+        before = (path[segment][0] - path[before_index][0],
+                  path[segment][1] - path[before_index][1])
+        after = (path[after_index][0] - path[segment][0],
+                 path[after_index][1] - path[segment][1])
+        first, second = math.hypot(*before), math.hypot(*after)
+        if first < 0.5 or second < 0.5:
+            return False
+        cosine = max(-1.0, min(1.0,
+            (before[0] * after[0] + before[1] * after[1]) / (first * second)))
+        return math.degrees(math.acos(cosine)) < 10.0
 
     def on_connect(self):
         if not HAS_AIRSIM:
@@ -811,9 +888,21 @@ class GCSApp:
 
     def _num(self, var, default):
         try:
-            return float(var.get())
+            value = float(var.get())
+            return value if math.isfinite(value) else default
         except (ValueError, TypeError):
             return default
+
+    def _load_calibration_profile(self):
+        """读取本机标定数据；它属于运行数据，不进入 Git 提交。"""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration.json")
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            data["tested_speeds"] = tuple(data.get("tested_speeds", ()))
+            return CalibrationProfile(**data)
+        except (OSError, ValueError, TypeError):
+            return CalibrationProfile()
 
     # =======================================================================
     # 航点编辑
@@ -821,13 +910,13 @@ class GCSApp:
 
     def _add_waypoint(self, x, y, z=None):
         z = -self._num(self.var_alt, DEFAULT_ALT) if z is None else z
-        self.waypoints.append(Waypoint(x, y, z, self._num(self.var_speed, DEFAULT_SPD)))
+        self.waypoints.append(Waypoint(x, y, z))
         self._refresh_wp_tree()
 
     @staticmethod
     def _wp_row(i, w):
         return (i + 1, "%.1f" % w.x, "%.1f" % w.y,
-                "%.1f" % w.altitude, "%.1f" % w.speed, "%.1f" % w.hold)
+                "%.1f" % w.altitude, "%.1f" % w.hold)
 
     def _update_wp_row(self, i):
         """只刷一行。拖航点时会一帧一次地调，重建整张表会卡。"""
@@ -852,11 +941,18 @@ class GCSApp:
 
     def _invalidate_route(self):
         """航点或障碍一改，之前规划出来的航线就作废了。"""
-        if self.route:
+        self.map_revision += 1
+        if self._cruise_active or self._calibrating:
+            self.stop_evt.set()
+        if self.trajectory is not None:
+            self.trajectory = None
+            self.plan_limits = None
+            self.plan_start = None
+            self.route_revision = -1
             self.route = []
             self.route_xy = []
             self.route_cum = []
-            self.route_dense = []
+            self.info = {}
             self.lbl_plan.configure(text="航线已失效（航点或障碍发生了变化），请重新规划。",
                                     fg=WARN)
 
@@ -877,7 +973,6 @@ class GCSApp:
         self.wp_vars["x"].set("%.1f" % w.x)
         self.wp_vars["y"].set("%.1f" % w.y)
         self.wp_vars["alt"].set("%.1f" % w.altitude)
-        self.wp_vars["spd"].set("%.1f" % w.speed)
         self.wp_vars["hold"].set("%.1f" % w.hold)
 
     def wp_add(self):
@@ -895,7 +990,6 @@ class GCSApp:
         w.x = self._num(self.wp_vars["x"], w.x)
         w.y = self._num(self.wp_vars["y"], w.y)
         w.z = -abs(self._num(self.wp_vars["alt"], w.altitude))
-        w.speed = self._num(self.wp_vars["spd"], w.speed)
         w.hold = self._num(self.wp_vars["hold"], w.hold)
         self._refresh_wp_tree()
         self.wp_tree.selection_set(str(i))
@@ -963,7 +1057,7 @@ class GCSApp:
             with open(path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
             self.waypoints = [Waypoint.from_dict(d) for d in data.get("waypoints", [])]
-            self.obstacles = [Obstacle.from_dict(d) for d in data.get("obstacles", [])]
+            self.obstacles = [CircleObstacle.from_dict(d) for d in data.get("obstacles", [])]
         except Exception as exc:
             messagebox.showerror("载入失败", "文件读不出来：%s" % exc)
             return
@@ -977,7 +1071,7 @@ class GCSApp:
     # =======================================================================
 
     def _add_obstacle(self, x, y, r):
-        self.obstacles.append(Obstacle(x, y, r))
+        self.obstacles.append(CircleObstacle(x, y, r))
         self._refresh_obs_tree()
 
     def obs_add_demo(self):
@@ -1001,14 +1095,37 @@ class GCSApp:
     # =======================================================================
 
     def on_plan(self):
-        self._submit(self._job_plan,
-                     self._num(self.var_res, 0.5), self._num(self.var_clr, 0.8),
-                     self._num(self.var_alt, DEFAULT_ALT))
-
-    def _job_plan(self, res=0.5, clr=0.8, alt=DEFAULT_ALT):
-        if len(self.waypoints) == 0:
+        if not self.waypoints:
             self._log("还没有航点，先在地图上点几个（或按「示范航线」）。", "warn")
             return
+        requested_speed = max(0.5, min(15.0, self._num(self.var_speed, DEFAULT_SPD)))
+        clearance = max(0.0, self._num(self.var_clr, 0.8))
+        alt = abs(self._num(self.var_alt, DEFAULT_ALT))
+        waypoints = tuple(Waypoint(w.x, w.y, w.z, w.hold) for w in self.waypoints)
+        obstacles = tuple(self.obstacles)
+        revision = self.map_revision
+        profile = self.calibration_profile
+        limits = self._limits_for_planning(requested_speed, clearance, profile)
+        self._submit(self._job_plan, limits, alt, waypoints, obstacles, revision)
+
+    @staticmethod
+    def _limits_for_planning(requested_speed, clearance, profile):
+        """未标定时锁在 2 m/s；标定后才允许使用实测安全速度。"""
+        available_speed = profile.safe_max_speed if profile.calibrated else 2.0
+        return KinematicLimits(
+            max_speed=min(15.0, requested_speed, available_speed),
+            max_vertical_speed=2.0,
+            max_acceleration=max(0.5, profile.acceleration),
+            max_braking=max(0.5, profile.braking),
+            max_lateral_acceleration=max(0.5, profile.lateral_acceleration),
+            response_time=max(0.05, profile.response_time),
+            command_delay=max(0.0, profile.command_delay),
+            safety_clearance=clearance,
+            tracking_reserve=max(0.25, profile.cross_track_p95),
+        )
+
+    def _job_plan(self, limits, alt, waypoints, obstacles, revision):
+        """后台生成可行候选并按完整预计时间 T 选路线。"""
 
         # 起点必须取「起飞之后」的位置。飞机停在地面时 z 约等于 0，
         # 直接拿它当起点，会规划出一条「先俯冲到地面」的航线。
@@ -1021,30 +1138,265 @@ class GCSApp:
             start = (0.0, 0.0, -abs(alt))
 
         t0 = time.time()
-        route, dense, info = plan_route(start, self.waypoints, self.obstacles,
-                                        resolution=max(res, 0.2), clearance=max(clr, 0.0))
-        self.route = route
-        self.route_xy = [(p[0], p[1]) for p in route]
-        self.route_cum = cumulative_lengths(route)
-        self.route_dense = dense
-        self.info = info
+        try:
+            trajectory = plan_ordered_route(start, waypoints, obstacles, limits)
+        except PlanningError as exc:
+            message = str(exc)
+            self._log("路线规划失败：%s" % message, "err")
+            self.ui_q.put(("call", lambda: self.lbl_plan.configure(
+                text="规划失败：%s" % message, fg=DANGER)))
+            return
 
-        msg = ("规划完成：%.1f 米 / %d 个折点（障碍 %d 个，耗时 %.2f 秒）"
-               % (info["length"], len(route), len(self.obstacles), time.time() - t0))
-        self._log(msg, "ok")
-        for w in info["warnings"]:
-            self._log(w, "warn")
+        if revision != self.map_revision:
+            self._log("规划期间航点或参数发生变化，已丢弃旧规划结果。", "warn")
+            return
+
+        route = [sample.position for sample in trajectory.samples]
+        self.trajectory = trajectory
+        self.plan_limits = limits
+        self.plan_start = start
+        self.route_revision = revision
+        self.route = route
+        self.route_xy = [(sample.x, sample.y) for sample in trajectory.samples]
+        self.route_cum = [sample.distance for sample in trajectory.samples]
+        self.info = {
+            "length": trajectory.length,
+            "time": trajectory.estimated_time,
+            "minimum_clearance": trajectory.minimum_clearance,
+            "max_speed": limits.max_speed,
+        }
+
+        self._log(
+            "规划完成：%.1f 米，预计 %.1f 秒，速度上限 %.1f m/s，净空 %.2f m（%.2f 秒）"
+            % (trajectory.length, trajectory.estimated_time, limits.max_speed,
+               trajectory.minimum_clearance, time.time() - t0), "ok")
 
         def upd():
             self.lbl_plan.configure(
-                text=("航线总长 %.1f 米，共 %d 个折点。\n"
-                      "各段长度：%s\n"
-                      "A* 原始路径 %d 点，拉直后 %d 点。"
-                      % (info["length"], len(route),
-                         " / ".join("%.1f" % L for L in info["legs"]),
-                         len(dense), len(route))),
+                text=("连续平滑轨迹：%.1f 米 / 预计 T %.1f 秒\n"
+                      "可用速度上限 %.1f m/s；最低障碍边缘净空 %.2f m\n"
+                      "按输入顺序经过 %d 个航点，曲线全程已校验避障。"
+                      % (trajectory.length, trajectory.estimated_time, limits.max_speed,
+                         trajectory.minimum_clearance, len(waypoints))),
                 fg=OK)
         self.ui_q.put(("call", upd))
+
+    def on_calibrate(self):
+        """在当前规划的首段安全直线上运行一次实际速度标定。"""
+        if not self._require_conn():
+            return
+        if self._cruise_active or self._calibrating:
+            messagebox.showinfo("任务正在运行", "请先停止当前飞行任务，再开始标定。")
+            return
+        if (not self.flying or self.trajectory is None
+                or self.route_revision != self.map_revision or self.plan_limits is None):
+            messagebox.showinfo("需要有效航线", "先起飞并规划航线，再从规划起点开始标定。")
+            return
+        if not self.trajectory.waypoint_distances:
+            messagebox.showinfo("没有航点", "请先添加航点，再规划首段安全直线。")
+            return
+
+        trajectory = self.trajectory
+        limits = self.plan_limits
+        obstacles = tuple(self.obstacles)
+        first_distance = trajectory.waypoint_distances[0]
+        start = trajectory.samples[0].position
+        target = min(trajectory.samples, key=lambda sample: abs(sample.distance - first_distance)).position
+        horizontal = math.hypot(target[0] - start[0], target[1] - start[1])
+        stop_distance = 15.0 ** 2 / (2.0 * max(1.0, limits.max_braking))
+        stop_distance += 15.0 * (limits.response_time + limits.command_delay)
+        test_distance = sum(SPEED_STEPS) * 0.4
+        needed_distance = max(90.0, test_distance + stop_distance + 6.0)
+        if horizontal < needed_distance:
+            messagebox.showinfo(
+                "直线长度不足",
+                "标定会逐级测试到 15 m/s，首段必须是无遮挡、恒高直线，至少 %.0f m。\n"
+                "当前首段水平长度为 %.1f m。请在安全空域设置更长的首段。"
+                % (needed_distance, horizontal),
+            )
+            return
+
+        dx, dy = (target[0] - start[0]) / horizontal, (target[1] - start[1]) / horizontal
+        normal = (-dy, dx)
+        straight_deviation = max(
+            abs((sample.x - start[0]) * normal[0] + (sample.y - start[1]) * normal[1])
+            for sample in trajectory.samples
+            if sample.distance <= first_distance + 1e-6
+        )
+        if straight_deviation > 0.15 or abs(target[2] - start[2]) > 0.15:
+            messagebox.showinfo("首段不是直线", "首段曲线或高度变化超过标定范围，请重新选一段恒高直线。")
+            return
+
+        inflated = tuple(InflatedCircle(
+            obstacle.x, obstacle.y,
+            obstacle.radius + limits.safety_clearance + limits.tracking_reserve,
+            index,
+        ) for index, obstacle in enumerate(obstacles))
+        if not segment_clear(start[:2], target[:2], inflated):
+            messagebox.showinfo("首段有障碍", "首段没有满足膨胀后安全间距，不能用于速度标定。")
+            return
+        if math.dist(self._pos(), start) > 0.5:
+            messagebox.showinfo("飞机不在规划起点", "请把飞机停在规划起点，再开始标定。")
+            return
+
+        if not messagebox.askyesno(
+            "执行实际飞行标定",
+            "无人机将沿首段直线逐级加速，最高测试 15 m/s，并在直线内制动。\n"
+            "确认首段前方有至少 %.0f m 的空域，且没有未绘制障碍物。继续？"
+            % horizontal,
+        ):
+            return
+        revision = self.route_revision
+        self._submit(self._job_calibrate, trajectory, limits, obstacles,
+                     start, (dx, dy), normal, horizontal, revision)
+
+    def _job_calibrate(self, trajectory, limits, obstacles, start, direction,
+                       normal, line_length, revision):
+        """沿已验证的直线采集响应、加减速和横向误差，不自动规划返程。"""
+        if revision != self.map_revision or trajectory is not self.trajectory:
+            self._log("标定开始前航线已失效，请重新规划。", "err")
+            return
+        self._calibrating = True
+        self.stop_evt.clear()
+        self.pause_evt.clear()
+        self._set_mode("速度标定")
+        samples = []
+        success = False
+        z_target = start[2]
+        start_time = time.monotonic()
+        try:
+            for requested_speed in SPEED_STEPS:
+                stage_start = time.monotonic()
+                stage_rows = []
+                while time.monotonic() - stage_start < 0.4:
+                    if self.stop_evt.is_set() or revision != self.map_revision:
+                        break
+                    state = self.client.getMultirotorState(vehicle_name="")
+                    k = state.kinematics_estimated
+                    x, y, z = k.position.x_val, k.position.y_val, k.position.z_val
+                    vx, vy = k.linear_velocity.x_val, k.linear_velocity.y_val
+                    along = (x - start[0]) * direction[0] + (y - start[1]) * direction[1]
+                    cross = (x - start[0]) * normal[0] + (y - start[1]) * normal[1]
+                    cross_velocity = vx * normal[0] + vy * normal[1]
+                    along_speed = vx * direction[0] + vy * direction[1]
+                    if along > line_length - 6.0:
+                        raise RuntimeError("飞机接近标定直线末端，已停止继续加速")
+                    clearance = min((math.hypot(x - obstacle.x, y - obstacle.y)
+                                     - obstacle.radius for obstacle in obstacles),
+                                    default=float("inf"))
+                    if clearance < limits.safety_clearance:
+                        raise RuntimeError("标定时障碍净空不足，已停止测试")
+                    if abs(cross) > 0.5 or abs(z - z_target) > 1.0:
+                        raise RuntimeError("标定轨迹偏差或高度误差超限，已停止测试")
+                    row = CalibrationSample(
+                        time=time.monotonic() - start_time,
+                        requested_speed=requested_speed,
+                        along_speed=along_speed,
+                        cross_track=cross,
+                    )
+                    samples.append(row)
+                    stage_rows.append(row)
+                    lateral = max(-1.5, min(1.5, -1.8 * cross - 0.8 * cross_velocity))
+                    forward = math.sqrt(max(0.0, requested_speed ** 2 - lateral ** 2))
+                    self.client.moveByVelocityZAsync(
+                        direction[0] * forward + normal[0] * lateral,
+                        direction[1] * forward + normal[1] * lateral,
+                        z_target, 0.12,
+                        drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
+                        yaw_mode=airsim.YawMode(is_rate=False, yaw_or_rate=0.0),
+                    )
+                    time.sleep(0.05)
+                if self.stop_evt.is_set() or revision != self.map_revision:
+                    break
+                if stage_rows:
+                    deviations = sorted(abs(row.cross_track) for row in stage_rows)
+                    p95 = deviations[max(0, math.ceil(0.95 * len(deviations)) - 1)]
+                    average = sum(row.along_speed for row in stage_rows[-4:]) / min(4, len(stage_rows))
+                    if p95 > 0.25 or max(deviations) > 0.5 or average < max(
+                            0.8 * requested_speed, requested_speed - 0.5):
+                        self._log("%.0f m/s 未满足速度或 ±0.25 m 精度目标，停止更高速台阶。"
+                                  % requested_speed, "warn")
+                        break
+
+            # 记录停止指令后的速度衰减，用于保守估计制动能力。
+            if not self.stop_evt.is_set() and revision == self.map_revision:
+                brake_start = time.monotonic()
+                while time.monotonic() - brake_start < 1.5:
+                    if self.stop_evt.is_set() or revision != self.map_revision:
+                        break
+                    state = self.client.getMultirotorState(vehicle_name="")
+                    k = state.kinematics_estimated
+                    x, y, z = k.position.x_val, k.position.y_val, k.position.z_val
+                    vx, vy = k.linear_velocity.x_val, k.linear_velocity.y_val
+                    along_speed = vx * direction[0] + vy * direction[1]
+                    cross = (x - start[0]) * normal[0] + (y - start[1]) * normal[1]
+                    along = (x - start[0]) * direction[0] + (y - start[1]) * direction[1]
+                    clearance = min((math.hypot(x - obstacle.x, y - obstacle.y)
+                                     - obstacle.radius for obstacle in obstacles),
+                                    default=float("inf"))
+                    if along > line_length - 2.0 or abs(cross) > 0.5 or abs(z - z_target) > 1.0:
+                        raise RuntimeError("制动阶段接近直线边界或跟踪偏差超限")
+                    if clearance < limits.safety_clearance:
+                        raise RuntimeError("制动阶段障碍净空不足")
+                    samples.append(CalibrationSample(
+                        time=time.monotonic() - start_time,
+                        requested_speed=0.0,
+                        along_speed=along_speed,
+                        cross_track=cross,
+                        phase="braking",
+                    ))
+                    self.client.moveByVelocityZAsync(
+                        0.0, 0.0, z_target, 0.12,
+                        drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
+                        yaw_mode=airsim.YawMode(is_rate=False, yaw_or_rate=0.0),
+                    )
+                    time.sleep(0.05)
+                success = not self.stop_evt.is_set()
+        except Exception as exc:
+            self._log("速度标定中止：%s" % exc, "err")
+        finally:
+            try:
+                self.client.hoverAsync().join()
+            except Exception:
+                pass
+            self._calibrating = False
+            self._set_mode("已连接")
+
+        # 标定过程可能移动飞机；原规划起点不再可靠，即使测试中止也要作废。
+        self.ui_q.put(("call", lambda: self._invalidate_calibrated_route(trajectory, revision)))
+        if not success:
+            if self.stop_evt.is_set():
+                self._log("速度标定已停止；已悬停，原标定参数保留。", "warn")
+            return
+
+        result = analyze_calibration(samples, limits.max_lateral_acceleration)
+        if not result.profile.calibrated:
+            self._log("速度标定没有通过 0.25 m 偏差目标；继续使用保守 2 m/s。", "warn")
+            return
+        self.calibration_profile = result.profile
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration.json")
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(asdict(result.profile), fh, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            self._log("标定有效但未能写入本机配置：%s" % exc, "warn")
+
+        passed = max(trial.speed for trial in result.trials
+                     if trial.speed <= result.profile.safe_max_speed)
+        self._log(
+            "标定完成：安全上限 %.1f m/s，沿线偏差 P95 %.3f m；"
+            "加速度 %.2f、制动 %.2f m/s²，响应 %.2f s。"
+            % (result.profile.safe_max_speed, result.profile.cross_track_p95,
+               result.profile.acceleration, result.profile.braking,
+               result.profile.response_time), "ok")
+        if passed < 15.0:
+            self._log("15 m/s 未达到精度/速度条件，后续规划采用已通过的 %.1f m/s。"
+                      % passed, "warn")
+
+    def _invalidate_calibrated_route(self, trajectory, revision):
+        """若标定期间尚未生成新路线，则使原起点对应的轨迹失效。"""
+        if self.trajectory is trajectory and self.route_revision == revision:
+            self._invalidate_route()
 
     def on_upload(self):
         if not self._require_conn():
@@ -1100,119 +1452,135 @@ class GCSApp:
     def on_cruise(self):
         if not self._require_conn():
             return
-        # 控件值一律在界面线程读好再传进后台，后台线程不碰 Tk
-        self._submit(self._job_cruise,
-                     self._num(self.var_speed, DEFAULT_SPD),
-                     self.var_use_path.get(),
-                     self._num(self.var_alt, DEFAULT_ALT),
-                     self._num(self.var_res, 0.5),
-                     self._num(self.var_clr, 0.8))
-
-    def _job_cruise(self, speed=DEFAULT_SPD, use_path=False,
-                    alt=DEFAULT_ALT, res=0.5, clr=0.8):
-        if not self.flying:
-            self._job_takeoff(alt)
-        if not self.route:
-            self._log("还没规划航线，先自动规划一次。")
-            self._job_plan(res, clr, alt)
-        if not self.route:
-            self._log("航线规划失败，巡航中止。", "err")
+        if (self.trajectory is None or self.route_revision != self.map_revision
+                or self.plan_limits is None):
+            messagebox.showinfo("没有有效航线", "请先规划航线；巡航只执行当前有效的规划结果。")
             return
+        trajectory = self.trajectory
+        limits = self.plan_limits
+        obstacles = tuple(self.obstacles)
+        planned_start = self.plan_start
+        revision = self.route_revision
+        alt = abs(self._num(self.var_alt, DEFAULT_ALT))
+        self._submit(self._job_cruise, trajectory, limits, obstacles,
+                     planned_start, revision, alt)
 
+    def _job_cruise(self, trajectory, limits, obstacles, planned_start, revision, alt):
+        """以 20 Hz 预测控制执行已验证轨迹；失效或遥测异常就停机悬停。"""
+        if revision != self.map_revision or trajectory is not self.trajectory:
+            self._log("航线在启动前已失效，请重新规划。", "err")
+            return
         self.stop_evt.clear()
         self.pause_evt.clear()
         self.manual_evt.clear()
-        speed = max(speed, 0.5)
         self._set_mode("自动巡航")
+        self._sway_count = 0
+        self._sway_side = 0
+        self._max_waypoint_error = 0.0
+        self._cruise_deviations = []
+        self._minimum_cruise_clearance = float("inf")
+        self._cruise_elapsed = 0.0
+        self._cruise_active = True
+        completed = False
+        try:
+            if not self.flying:
+                self._job_takeoff(alt)
+            actual_start = self._pos()
+            if math.dist(actual_start, planned_start) > 0.5:
+                self.client.hoverAsync().join()
+                self._log("当前位置与规划起点相差 %.2f m；已悬停，请从正确起点重新规划。"
+                          % math.dist(actual_start, planned_start), "err")
+                return
 
-        if use_path:
-            self._cruise_path_api(speed)
-        else:
-            self._cruise_waypoint_by_waypoint(speed)
+            controller = PredictivePathController(trajectory, limits, obstacles)
+            self._log("开始沿平滑轨迹巡航：预计 T %.1f 秒，速度上限 %.1f m/s。"
+                      % (trajectory.estimated_time, limits.max_speed), "hi")
+            elapsed = 0.0
+            previous_tick = time.monotonic()
+            while not self.stop_evt.is_set():
+                cycle_start = time.monotonic()
+                if self.pause_evt.is_set():
+                    self.client.hoverAsync().join()
+                    self._log("巡航已暂停，飞机悬停；继续前会检查安全接回原轨迹。", "warn")
+                    while self.pause_evt.is_set() and not self.stop_evt.is_set():
+                        time.sleep(0.05)
+                    if self.stop_evt.is_set():
+                        break
+                    with self._lock:
+                        resumed = dict(self.telem)
+                    if not resumed or time.monotonic() - resumed.get("monotonic", 0.0) > 0.30:
+                        self._log("遥测已过期，不能安全恢复巡航；飞机保持悬停。", "err")
+                        break
+                    _progress, _deviation, fault = controller.check_state(
+                        (resumed["x"], resumed["y"], resumed["z"]))
+                    if fault:
+                        self._log("无法安全接回原轨迹：%s；飞机保持悬停。" % fault, "err")
+                        break
+                    previous_tick = time.monotonic()
+                    self._log("已安全接回原轨迹，继续巡航。", "ok")
+                    continue
 
-        if self.stop_evt.is_set():
-            self._log("巡航已停止。", "warn")
-        elif not use_path:
-            self._log("巡航完成，已到达航线终点并悬停。", "ok")
+                now = time.monotonic()
+                elapsed += max(0.0, now - previous_tick)
+                previous_tick = now
+                self._cruise_elapsed = elapsed
+                with self._lock:
+                    telemetry = dict(self.telem)
+                if (not telemetry
+                        or now - telemetry.get("monotonic", 0.0) > 0.30):
+                    self.client.hoverAsync().join()
+                    self._log("遥测超过 0.30 秒未更新，已悬停并中止巡航。", "err")
+                    break
+
+                result = controller.step(
+                    (telemetry["x"], telemetry["y"], telemetry["z"]),
+                    (telemetry["vx"], telemetry["vy"], telemetry["vz"]),
+                    elapsed,
+                )
+                if result.fault:
+                    self.client.hoverAsync().join()
+                    self._log("自动巡航安全停止：%s。" % result.fault, "err")
+                    break
+                self.cruise_index = min(
+                    len(trajectory.waypoint_distances) - 1,
+                    sum(distance <= result.progress + 1e-6
+                        for distance in trajectory.waypoint_distances),
+                )
+                self.client.moveByVelocityZAsync(
+                    result.vx, result.vy, result.z, 0.12,
+                    drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
+                    yaw_mode=airsim.YawMode(is_rate=False, yaw_or_rate=0.0),
+                )
+                if result.finished:
+                    completed = True
+                    break
+                remaining = 0.05 - (time.monotonic() - cycle_start)
+                if remaining > 0.0:
+                    time.sleep(remaining)
+        except Exception as exc:
+            self._log("巡航执行异常：%s；尝试悬停。" % exc, "err")
+        finally:
+            try:
+                self.client.hoverAsync().join()
+            except Exception:
+                pass
+            self._cruise_active = False
+            self.cruise_index = -1
             self._set_mode("已连接")
 
-    def _nearest_route_index(self):
-        """当前位置最接近航线上的第几个折点，用于暂停后从断点续飞。"""
-        p = self._pos()
-        best, best_d = 0, float("inf")
-        for i, (x, y, z) in enumerate(self.route):
-            d = math.dist(p, (x, y, z))
-            if d < best_d:
-                best, best_d = i, d
-        return best
-
-    def _cruise_path_api(self, speed):
-        """任务书要求的做法：一次性把整条路径交给 moveOnPathAsync。"""
-        total = self.info.get("length", 0.0)
-        timeout = total / speed * 4 + 60
-        goal = self.route[-1]
-
-        while True:
-            # 暂停恢复后，从最近的折点接着往后续飞，而不是从头再飞一遍
-            i0 = self._nearest_route_index()
-            pts = [airsim.Vector3r(x, y, z) for (x, y, z) in self.route[i0:]]
-            if not pts:
-                break
-            self._log("moveOnPathAsync 下发 %d 个路径点（自第 %d 点起），"
-                      "总长 %.1f 米，速度 %.1f m/s。" % (len(pts), i0 + 1, total, speed), "hi")
-            self.client.moveOnPathAsync(pts, speed, timeout_sec=timeout,
-                                        drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
-                                        yaw_mode=airsim.YawMode(is_rate=False, yaw_or_rate=0.0),
-                                        lookahead=-1, adaptive_lookahead=1)
-            res = self._poll(lambda p: math.dist(p, goal) < POSITION_EPS, timeout=timeout)
-            if res != "resume":
-                break
-
-        if res == "timeout":
-            self._log("整段巡航超时，飞行可能被障碍或风力影响，请检查。", "warn")
-            self.client.cancelLastTask()
-        self.client.hoverAsync().join()
-        if not self.stop_evt.is_set():
-            self._log("已到达终点并悬停。", "ok")
-
-    def _cruise_waypoint_by_waypoint(self, speed):
-        """逐点巡航：每个折点单独下发，因此可以随时暂停、停止、看进度。"""
-        n = len(self.route)
-        for i, (x, y, z) in enumerate(self.route):
-            if self.stop_evt.is_set():
-                return
-            self.cruise_index = i
-            wp_speed = speed
-            hold = 0.0
-            # 如果这个折点正好是一个用户航点，就用它自己的速度和悬停时间
-            for w in self.waypoints:
-                if abs(w.x - x) < 1e-6 and abs(w.y - y) < 1e-6:
-                    wp_speed = w.speed
-                    hold = w.hold
-                    break
-
-            self._log("飞往折点 %d/%d  (%.1f, %.1f, 高度 %.1f)" % (i + 1, n, x, y, -z))
-            # 暂停恢复后要重新下发「同一个」折点：飞机被 cancelLastTask 停在半路，
-            # 直接进下一个折点就等于跳过一个，航线会走形。
-            while True:
-                self.client.moveToPositionAsync(
-                    x, y, z, wp_speed, timeout_sec=120,
-                    drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
-                    yaw_mode=airsim.YawMode(is_rate=False, yaw_or_rate=0.0))
-                res = self._poll(lambda p, t=(x, y, z): math.dist(p, t) < POSITION_EPS,
-                                 timeout=120)
-                if res != "resume":
-                    break
-            if res == "stop":
-                return
-            if res == "timeout":
-                self._log("折点 %d 等待超时，继续下一段。" % (i + 1), "warn")
-            if hold > 0:
-                self._log("到点悬停 %.1f 秒。" % hold)
-                self.client.hoverAsync()
-                if self._sleep_watch(hold) == "stop":
-                    return
-        self.cruise_index = -1
+        if completed:
+            deviations = sorted(self._cruise_deviations)
+            p95 = (deviations[max(0, math.ceil(0.95 * len(deviations)) - 1)]
+                   if deviations else 0.0)
+            minimum = self._minimum_cruise_clearance
+            clearance_text = "%.2f m" % minimum if math.isfinite(minimum) else "无障碍物"
+            self._log(
+                "巡航完成：实际 T %.1f s；航点最大误差 %.3f m；"
+                "横向偏差 P95 %.3f m；最低障碍边缘净空 %s；直线摆动 %d 次。"
+                % (elapsed, self._max_waypoint_error, p95,
+                   clearance_text, self._sway_count), "ok")
+        elif self.stop_evt.is_set():
+            self._log("巡航已停止，飞机悬停。", "warn")
 
     def _poll(self, cond, timeout=60.0):
         """轮询直到条件满足；期间响应「停止」与「暂停」。
@@ -1317,8 +1685,10 @@ class GCSApp:
         if self.home is None:
             messagebox.showinfo("未知起点", "还没有起飞过，不知道返航点在哪。")
             return
+        requested = max(0.5, min(15.0, self._num(self.var_speed, DEFAULT_SPD)))
+        safe = self.calibration_profile.safe_max_speed if self.calibration_profile.calibrated else 2.0
         self._submit(self._job_rtl, self._num(self.var_alt, DEFAULT_ALT),
-                     self._num(self.var_speed, DEFAULT_SPD))
+                     min(requested, safe))
 
     def _job_rtl(self, alt=DEFAULT_ALT, speed=DEFAULT_SPD):
         self.stop_evt.clear()
@@ -1630,11 +2000,12 @@ class GCSApp:
         if not t:
             self.lbl_status.configure(text="等待连接 ...  |  航点 %d  |  航线 %s"
                                            % (len(self.waypoints),
-                                              "%.1f m" % self.info["length"] if self.route else "未规划"))
+                                              "%.1f m" % self.info.get("length", 0.0)
+                                              if self.route else "未规划"))
             return
         dev_txt = "     偏差 %.2f m" % t.get("dev", 0.0) if self.route else ""
-        prog = ("      进度 %d/%d" % (self.cruise_index + 1, len(self.route))
-                if 0 <= self.cruise_index < len(self.route) else "")
+        prog = ("      进度 %d/%d" % (self.cruise_index + 1, len(self.waypoints))
+                if 0 <= self.cruise_index < len(self.waypoints) else "")
         self.lbl_status.configure(
             text=("X %7.2f   Y %7.2f   高度 %5.2f m   速度 %5.2f m/s   "
                   "偏航 %6.1f°%s%s      模式 %s"
@@ -1677,18 +2048,15 @@ class GCSApp:
                 flat += [sx, sy]
             c.create_line(*flat, fill=CYAN, width=2, smooth=False)
 
-        # A* 原始路径（细虚线，用来看规划器到底怎么绕的）
-        if self.var_show_dense.get() and len(self.route_dense) > 1:
-            flat = []
-            for (x, y) in self.route_dense:
-                sx, sy = self.w2s(x, y)
-                flat += [sx, sy]
-            c.create_line(*flat, fill="#5B4B75", width=1, dash=(3, 3))
-
         # 障碍物
         for o in self.obstacles:
             sx, sy = self.w2s(o.x, o.y)
             r = o.r * self.scale
+            safety = self._num(self.var_clr, 0.8)
+            tracking = max(0.25, self.calibration_profile.cross_track_p95)
+            inflated = (o.r + safety + tracking + 0.35) * self.scale
+            c.create_oval(sx - inflated, sy - inflated, sx + inflated, sy + inflated,
+                          outline=WARN, width=1, dash=(4, 3))
             c.create_oval(sx - r, sy - r, sx + r, sy + r,
                           outline=DANGER, width=2, fill="#3A1E24")
             c.create_line(sx - 5, sy, sx + 5, sy, fill=DANGER)

@@ -46,13 +46,27 @@ def plan_ordered_route(
     """规划一条按输入顺序经过所有航点的、避障且带时间参数的航迹。"""
     if not waypoints:
         raise PlanningError("还没有航点")
+    numeric_limits = (
+        limits.max_speed, limits.max_vertical_speed, limits.max_acceleration,
+        limits.max_braking, limits.max_lateral_acceleration, limits.response_time,
+        limits.command_delay, limits.safety_clearance, limits.tracking_reserve,
+    )
+    if not all(math.isfinite(value) for value in numeric_limits):
+        raise PlanningError("飞行约束必须是有限数值")
+    if len(start) != 3 or not all(math.isfinite(float(value)) for value in start):
+        raise PlanningError("规划起点必须是有限坐标")
     if limits.max_speed <= 0.0:
         raise PlanningError("最高速度必须大于 0 m/s")
     if min(limits.max_vertical_speed, limits.max_acceleration,
            limits.max_braking, limits.max_lateral_acceleration) <= 0.0:
         raise PlanningError("垂直速度、加速度、制动能力和横向加速度必须大于 0")
-    if limits.safety_clearance < 0.0 or limits.tracking_reserve < 0.0:
-        raise PlanningError("安全间距和跟踪余量不能为负数")
+    if (limits.safety_clearance < 0.0 or limits.tracking_reserve < 0.0
+            or limits.response_time < 0.0 or limits.command_delay < 0.0):
+        raise PlanningError("安全间距、跟踪余量和响应延迟不能为负数")
+    if (settings.max_candidates_per_leg < 1 or settings.beam_width < 1
+            or not math.isfinite(settings.curve_margin) or settings.curve_margin < 0.0
+            or not math.isfinite(settings.sample_spacing) or settings.sample_spacing <= 0.0):
+        raise PlanningError("候选数量、曲线余量或采样间距无效")
 
     targets = [(float(start[0]), float(start[1]), float(start[2]))]
     targets.extend(waypoint.position for waypoint in waypoints)
