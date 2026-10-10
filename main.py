@@ -1180,7 +1180,7 @@ class GCSApp:
             response_time=max(0.05, profile.response_time),
             command_delay=max(0.0, profile.command_delay),
             safety_clearance=clearance,
-            tracking_reserve=max(0.25, profile.cross_track_p95),
+            tracking_reserve=max(0.35, profile.cross_track_p95),
             velocity_time_constant=profile.velocity_time_constant,
             velocity_acceleration=profile.velocity_acceleration,
             control_period=profile.control_period,
@@ -2245,7 +2245,7 @@ class GCSApp:
             sx, sy = self.w2s(o.x, o.y)
             r = o.r * self.scale
             safety = self._num(self.var_clr, 0.8)
-            tracking = max(0.25, self.calibration_profile.cross_track_p95)
+            tracking = max(0.35, self.calibration_profile.cross_track_p95)
             inflated = (o.r + safety + tracking + 0.35) * self.scale
             c.create_oval(sx - inflated, sy - inflated, sx + inflated, sy + inflated,
                           outline=WARN, width=1, dash=(4, 3))

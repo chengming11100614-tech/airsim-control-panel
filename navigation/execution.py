@@ -21,9 +21,10 @@ from .models import (
 PREDICTED_STRAIGHT_WAYPOINT_TOLERANCE = 0.6
 PREDICTED_TURN_WAYPOINT_TOLERANCE = 1.25
 
-# 两次相同任务的实飞用时比闭环预测长约 1.5%。校准只作用于预测时间轴，
+# 当前赛道高性能配置三次实飞的平均用时比 1.015 时钟预测长约 0.13%；
+# 1.017 使三趟同时间位置误差 P95 都低于 0.19 m。校准只改预测时间轴，
 # 并同步调整预测速度/加速度；它不改变规划几何或实际巡航控制指令。
-EMPIRICAL_EXECUTION_TIME_SCALE = 1.015
+EMPIRICAL_EXECUTION_TIME_SCALE = 1.017
 
 
 def predict_execution(

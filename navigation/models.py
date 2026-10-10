@@ -88,11 +88,11 @@ class CalibrationProfile:
 
     calibrated: bool = False
     safe_max_speed: float = 2.0
-    # 五航点竞速线路三次实飞验证了 2.4/0.75 m/s² 的规划加减速上限；
-    # 它们只安排沿线加速和弯前制动，AirSim 的实际响应仍由下方模型限制。
+    # 同一竞速线路重复飞行验证了 2.4/0.75 m/s² 纵向规划能力、
+    # 1.15 m/s² 弯中横向能力和 0.35 m 跟踪预留；实际响应仍由下方模型限制。
     acceleration: float = 2.4
     braking: float = 0.75
-    lateral_acceleration: float = 1.0
+    lateral_acceleration: float = 1.15
     response_time: float = 0.25
     command_delay: float = 0.05
     cross_track_p95: float = 0.0
@@ -110,14 +110,14 @@ class KinematicLimits:
 
     max_speed: float = 15.0
     max_vertical_speed: float = 2.0
-    # 与默认标定档保持一致，按可用距离生成动态加速和制动曲线。
+    # 以下默认值来自同一赛道三次无碰撞实飞；其它航线仍由闭环预测逐条校验。
     max_acceleration: float = 2.4
     max_braking: float = 0.75
-    max_lateral_acceleration: float = 1.0
+    max_lateral_acceleration: float = 1.15
     response_time: float = 0.25
     command_delay: float = 0.05
     safety_clearance: float = 0.8
-    tracking_reserve: float = 0.25
+    tracking_reserve: float = 0.35
     # AirSim 实测速度响应：一阶时间常数和速度矢量最大变化率。
     velocity_time_constant: float = 1.3
     velocity_acceleration: float = 1.3

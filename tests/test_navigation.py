@@ -180,7 +180,8 @@ class RoutePlanningTests(unittest.TestCase):
         self.assertLessEqual(prediction.waypoint_errors[3], 1.25)
         self.assertLessEqual(prediction.waypoint_errors[2], 0.6)
         self.assertLessEqual(prediction.waypoint_errors[4], 0.6)
-        self.assertAlmostEqual(trajectory.length, 84.7, delta=0.2)
+        # 跟踪预留从 0.25 m 提高到 0.35 m 后，外绕弧线相应变长约 0.37 m。
+        self.assertAlmostEqual(trajectory.length, 85.07, delta=0.2)
         self.assertLess(measured_turn_error, 0.2)
         self.assertGreaterEqual(
             trajectory.minimum_clearance,
@@ -310,6 +311,8 @@ class RoutePlanningTests(unittest.TestCase):
         self.assertEqual(limits.max_speed, 15.0)
         self.assertEqual(limits.max_acceleration, 2.4)
         self.assertEqual(limits.max_braking, 0.75)
+        self.assertEqual(limits.max_lateral_acceleration, 1.15)
+        self.assertEqual(limits.tracking_reserve, 0.35)
         self.assertEqual(limits.command_delay, 0.05)
         self.assertEqual(limits.velocity_time_constant, 1.3)
         self.assertEqual(limits.velocity_acceleration, 1.3)
