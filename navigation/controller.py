@@ -39,7 +39,8 @@ class CarrotPathController:
 
     目标点始终取自原规划曲线的前方。控制器直接朝前视点给出速度方向，
     因而飞机过弯时可以自然走弦线、向弯内收；它不会把这种合理偏差硬拉回
-    曲线中心。速度大小仍受规划器输出的逐点速度曲线和实测加速度约束控制。
+    曲线中心。速度大小读取规划器的逐点曲线，并在连续加速段补偿响应滞后；
+    弯道限速和制动点仍由原速度曲线约束。
     """
 
     def __init__(
@@ -146,9 +147,9 @@ class CarrotPathController:
             (x, y), (target.x, target.y), tangent, lookahead
         )
 
-        # 速度曲线已在弯前按曲率提前减速；控制器只读取当前进度，不因偏差降速，
-        # 避免偏航时减速、转向、再反向修正形成周期性摆动。
-        scheduled_speed = self._scheduled_speed(progress)
+        # 速度曲线已按可用加速和制动距离排好时序。连续加速段会向前预读少量，
+        # 只补偿控制响应滞后，不因横向偏差降速，避免偏航时减速后再摆动修正。
+        scheduled_speed = self._speed_with_acceleration_preview(progress, actual_speed)
         if self._next_waypoint == len(self.trajectory.waypoint_distances) - 1:
             scheduled_speed = min(scheduled_speed, self._final_braking_cap(progress))
         desired = (direction[0] * scheduled_speed,
@@ -322,6 +323,61 @@ class CarrotPathController:
         probe_speed = math.hypot(probe.vx, probe.vy)
         # 探测只用于从静止开始和越过无悬停的短暂停车点，不越过局部速度上限。
         return min(self.limits.max_speed, speed + 0.30 * probe_speed)
+
+    def _speed_with_acceleration_preview(self, progress, actual_speed):
+        """在连续加速段提前给油，补偿 AirSim 速度响应滞后。
+
+        只读取当前路线速度曲线前方一个响应距离，并限制增量和当前曲率速度上限。
+        如果这段距离里遇到减速、弯道速度谷或停车点，就保留原速度计划，避免跨过
+        已规划的制动区。这样能更早利用长直线的加速距离，却不会把下一段的速度
+        提前带进弯道。
+        """
+        current_speed = self._scheduled_speed(progress)
+        response_horizon = max(
+            0.0, self.limits.response_time + self.limits.command_delay
+        )
+        if response_horizon <= 1e-6 or progress >= self._distances[-1] - 1e-5:
+            return current_speed
+
+        lead_distance = min(
+            1.5,
+            max(
+                0.25,
+                actual_speed * response_horizon
+                + 0.5 * self.limits.max_acceleration * response_horizon ** 2,
+            ),
+        )
+        target_distance = min(self._distances[-1], progress + lead_distance)
+        future_speed = self._scheduled_speed(target_distance)
+        if future_speed <= current_speed + 0.02:
+            return current_speed
+        if self._has_speed_drop(progress, target_distance, current_speed):
+            return current_speed
+
+        # 不因前视加速超过当前位置的曲率约束；速度下降仍完全由原计划决定。
+        curvature = abs(self._sample_at_distance(progress).curvature)
+        curve_cap = (
+            math.sqrt(max(0.01, self.limits.max_lateral_acceleration) / curvature)
+            if curvature > 1e-8 else self.limits.max_speed
+        )
+        increase_cap = self.limits.max_acceleration * response_horizon
+        return max(
+            current_speed,
+            min(future_speed, current_speed + increase_cap, curve_cap,
+                self.limits.max_speed),
+        )
+
+    def _has_speed_drop(self, first_distance, last_distance, current_speed):
+        """检查前视范围内是否先遇到减速或停车，防止加速跨过速度谷。"""
+        first_index = bisect_right(self._distances, first_distance + 1e-6)
+        for index in range(first_index, len(self.trajectory.samples)):
+            sample = self.trajectory.samples[index]
+            if sample.distance > last_distance + 1e-6:
+                break
+            planned_speed = math.hypot(sample.vx, sample.vy)
+            if planned_speed < current_speed - 0.05:
+                return True
+        return False
 
     @staticmethod
     def _lookahead_distance(actual_speed, deviation, curvature):

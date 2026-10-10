@@ -377,6 +377,55 @@ class ControllerTests(unittest.TestCase):
         )
         self.assertLess(offset_result.vy, 0.0)
 
+    def test_acceleration_preview_uses_open_speed_ramp_and_respects_curvature_cap(self):
+        speeds = (0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 0.0)
+
+        def trajectory(curvature):
+            samples = tuple(TrajectorySample(
+                time=float(index), distance=float(index),
+                x=float(index), y=0.0, z=-5.0,
+                vx=speed, vy=0.0, vz=0.0,
+                ax=0.0, ay=0.0, az=0.0, curvature=curvature,
+            ) for index, speed in enumerate(speeds))
+            return PlannedTrajectory(samples, (10.0,), 10.0, 10.0,
+                                     float("inf"), "speed-preview")
+
+        limits = _limits(speed=5.0)
+        straight = CarrotPathController(trajectory(0.0), limits)
+        current = straight._scheduled_speed(2.0)
+        preview = straight._speed_with_acceleration_preview(2.0, actual_speed=1.0)
+        self.assertGreater(preview, current)
+        self.assertLessEqual(
+            preview, current + limits.max_acceleration
+            * (limits.response_time + limits.command_delay) + 1e-9,
+        )
+
+        curved = CarrotPathController(trajectory(0.5), limits)
+        current = curved._scheduled_speed(2.0)
+        preview = curved._speed_with_acceleration_preview(2.0, actual_speed=1.0)
+        self.assertLessEqual(
+            preview, math.sqrt(limits.max_lateral_acceleration / 0.5) + 1e-9,
+        )
+        self.assertGreaterEqual(preview, current)
+
+    def test_acceleration_preview_does_not_cross_a_planned_stop(self):
+        speeds = (0.0, 1.0, 1.5, 2.0, 1.0, 0.0,
+                  1.0, 1.5, 2.0, 1.0, 0.0)
+        samples = tuple(TrajectorySample(
+            time=float(index), distance=float(index),
+            x=float(index), y=0.0, z=-5.0,
+            vx=speed, vy=0.0, vz=0.0,
+            ax=0.0, ay=0.0, az=0.0, curvature=0.0,
+        ) for index, speed in enumerate(speeds))
+        route = PlannedTrajectory(samples, (5.0, 10.0), 10.0, 10.0,
+                                  float("inf"), "stop-preview")
+        controller = CarrotPathController(route, _limits(speed=3.0))
+
+        current = controller._scheduled_speed(4.9)
+        preview = controller._speed_with_acceleration_preview(4.9, actual_speed=1.5)
+
+        self.assertAlmostEqual(preview, current)
+
     def test_lookahead_naturally_cuts_toward_the_inside_of_a_turn(self):
         points = []
         for index in range(101):
