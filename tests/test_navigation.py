@@ -12,7 +12,12 @@ from navigation.calibration import (
 from navigation.controller import CarrotPathController
 from navigation.curve import fit_safe_curve
 from navigation.demo import demo_obstacles, demo_waypoints
-from navigation.execution import predict_execution, sample_execution_at_time
+from navigation.execution import (
+    EMPIRICAL_EXECUTION_TIME_SCALE,
+    _scale_prediction_clock,
+    predict_execution,
+    sample_execution_at_time,
+)
 from navigation.geometry import inflate_obstacles, plan_leg_candidates
 from navigation.models import (
     CircleObstacle,
@@ -272,10 +277,31 @@ class RoutePlanningTests(unittest.TestCase):
         prediction = selected.execution_prediction
         self.assertAlmostEqual(
             prediction.samples[1].time - prediction.samples[0].time,
-            limits.control_period,
+            limits.control_period * EMPIRICAL_EXECUTION_TIME_SCALE,
         )
         midpoint = sample_execution_at_time(prediction, prediction.estimated_time * 0.5)
         self.assertAlmostEqual(midpoint.time, prediction.estimated_time * 0.5)
+        self.assertAlmostEqual(prediction.samples[-1].time, prediction.estimated_time)
+
+    def test_prediction_clock_fit_preserves_waypoint_hold_duration(self):
+        samples = tuple(TrajectorySample(
+            time=when, distance=when, x=when, y=0.0, z=-5.0,
+            vx=1.0, vy=0.0, vz=0.0, ax=2.0, ay=0.0, az=0.0,
+            curvature=0.0,
+        ) for when in (0.0, 1.0, 4.0, 5.0))
+
+        adjusted, total = _scale_prediction_clock(samples, 5.0, [(1.0, 4.0)])
+
+        self.assertAlmostEqual(adjusted[1].time - adjusted[0].time,
+                               EMPIRICAL_EXECUTION_TIME_SCALE)
+        self.assertAlmostEqual(adjusted[2].time - adjusted[1].time, 3.0)
+        self.assertAlmostEqual(adjusted[3].time - adjusted[2].time,
+                               EMPIRICAL_EXECUTION_TIME_SCALE)
+        self.assertAlmostEqual(adjusted[0].vx, 1.0 / EMPIRICAL_EXECUTION_TIME_SCALE)
+        self.assertAlmostEqual(adjusted[1].vx, 1.0)
+        self.assertAlmostEqual(adjusted[0].ax,
+                               2.0 / EMPIRICAL_EXECUTION_TIME_SCALE ** 2)
+        self.assertAlmostEqual(total, adjusted[-1].time)
 
     def test_uncalibrated_panel_keeps_user_speed_cap_for_time_planning(self):
         limits = GCSApp._limits_for_planning(

@@ -2,6 +2,7 @@
 
 from collections import deque
 from bisect import bisect_right
+from dataclasses import replace
 import math
 from typing import Optional, Sequence
 
@@ -19,6 +20,10 @@ from .models import (
 # 直线航点仍用 0.6 m；顺序完整性与障碍净空在所有位置都是硬约束。
 PREDICTED_STRAIGHT_WAYPOINT_TOLERANCE = 0.6
 PREDICTED_TURN_WAYPOINT_TOLERANCE = 1.25
+
+# 两次相同任务的实飞用时比闭环预测长约 1.5%。校准只作用于预测时间轴，
+# 并同步调整预测速度/加速度；它不改变规划几何或实际巡航控制指令。
+EMPIRICAL_EXECUTION_TIME_SCALE = 1.015
 
 
 def predict_execution(
@@ -71,6 +76,8 @@ def predict_execution(
     states = [
         (0.0, distance, position, velocity, (0.0, 0.0), 0.0)
     ]
+    hold_intervals = []
+    active_hold_start = None
     minimum_clearance = _point_clearance(position, obstacles)
     complete = False
 
@@ -82,6 +89,12 @@ def predict_execution(
             # 与运行面板相同，控制器按观测到的遥测周期逐步调整指令变化率。
             controller.update_period(dt)
         result = controller.step(position, velocity, elapsed)
+        if result.controller_mode == "waypoint-hold":
+            if active_hold_start is None:
+                active_hold_start = elapsed
+        elif active_hold_start is not None:
+            hold_intervals.append((active_hold_start, elapsed))
+            active_hold_start = None
         for waypoint_index, error in result.waypoint_passages:
             errors[waypoint_index] = error
         if result.fault:
@@ -123,7 +136,12 @@ def predict_execution(
         ))
         position, velocity = next_position, next_velocity
 
+    if active_hold_start is not None:
+        hold_intervals.append((active_hold_start, elapsed))
     samples = _to_samples(states)
+    samples, estimated_time = _scale_prediction_clock(
+        samples, elapsed, hold_intervals
+    )
     waypoint_errors = tuple(errors)
     waypoint_tolerances = tuple(
         PREDICTED_TURN_WAYPOINT_TOLERANCE
@@ -144,12 +162,48 @@ def predict_execution(
     )
     return ExecutionPrediction(
         samples=samples,
-        estimated_time=elapsed,
+        estimated_time=estimated_time,
         minimum_clearance=minimum_clearance,
         waypoint_errors=waypoint_errors,
         complete=complete,
         safe=safe,
     )
+
+
+def _scale_prediction_clock(samples, total_time, hold_intervals):
+    """校准飞行预测时钟，并保持用户设定的航点悬停时长不变。"""
+    scale = EMPIRICAL_EXECUTION_TIME_SCALE
+    if scale == 1.0 or not samples:
+        return tuple(samples), total_time
+
+    def held_time_before(when):
+        return sum(
+            max(0.0, min(when, end) - start)
+            for start, end in hold_intervals
+            if when > start
+        )
+
+    adjusted = []
+    for sample in samples:
+        held = held_time_before(sample.time)
+        moving_time = max(0.0, sample.time - held)
+        in_hold = any(start <= sample.time < end for start, end in hold_intervals)
+        local_scale = 1.0 if in_hold else scale
+        adjusted.append(replace(
+            sample,
+            time=sample.time + (scale - 1.0) * moving_time,
+            vx=sample.vx / local_scale,
+            vy=sample.vy / local_scale,
+            vz=sample.vz / local_scale,
+            ax=sample.ax / (local_scale * local_scale),
+            ay=sample.ay / (local_scale * local_scale),
+            az=sample.az / (local_scale * local_scale),
+        ))
+
+    adjusted_total = total_time + (scale - 1.0) * max(
+        0.0, total_time - held_time_before(total_time)
+    )
+    return tuple(adjusted), adjusted_total
 
 
 def sample_execution_at_time(prediction: ExecutionPrediction, when: float):
