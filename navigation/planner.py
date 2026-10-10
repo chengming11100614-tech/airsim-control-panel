@@ -6,12 +6,13 @@ import json
 import math
 from typing import Sequence, Tuple
 
-from .curve import CurveSamples, fit_safe_curve
+from .curve import CurveSamples, fit_safe_curve, splice_straight_leg
 from .geometry import (
     GeometricPath,
     InflatedCircle,
     inflate_obstacles,
     plan_leg_candidates,
+    segment_clear,
 )
 from .models import (
     CircleObstacle,
@@ -128,28 +129,63 @@ def plan_ordered_route(
 
     feasible = []
     for route_points, anchors, topology, _score in states:
-        curve = fit_safe_curve(
+        base_curve = fit_safe_curve(
             route_points,
             anchors,
             protected_circles,
             sample_spacing=settings.sample_spacing,
         )
-        if curve is None:
-            continue
-        try:
-            trajectory = time_parameterize(curve, waypoints, limits, signature)
-        except ValueError:
-            continue
-        clearance = _minimum_center_clearance(curve.positions, obstacles)
-        trajectory = PlannedTrajectory(
-            samples=trajectory.samples,
-            waypoint_distances=trajectory.waypoint_distances,
-            estimated_time=trajectory.estimated_time,
-            length=trajectory.length,
-            minimum_clearance=clearance,
-            mission_signature=trajectory.mission_signature,
-        )
-        feasible.append((trajectory.estimated_time, topology, trajectory))
+        curve_candidates = []
+        if base_curve is not None:
+            curve_candidates.append(base_curve)
+
+        # 如果可见图本来给出一条直线，但全局样条把它弯开，增加两种真实可飞的
+        # 版本：曲线切向平滑接入；若安全校验失败，则在航点停车后沿直线飞行。
+        for leg_index, anchor_index in enumerate(anchors):
+            first_index = 0 if leg_index == 0 else anchors[leg_index - 1]
+            if anchor_index != first_index + 1:
+                continue
+            start_xy = route_points[first_index][:2]
+            end_xy = route_points[anchor_index][:2]
+            if not segment_clear(start_xy, end_xy, search_circles):
+                continue
+            try:
+                smooth_straight = fit_safe_curve(
+                    route_points,
+                    anchors,
+                    protected_circles,
+                    sample_spacing=settings.sample_spacing,
+                    preserve_straight_leg=leg_index,
+                )
+            except ValueError:
+                smooth_straight = None
+            if smooth_straight is not None:
+                curve_candidates.append(smooth_straight)
+            elif base_curve is not None:
+                # 两段外侧仍采用已认证曲线，直线只连接原样条经过的精确航点。
+                curve_candidates.append(splice_straight_leg(
+                    route_points,
+                    anchors,
+                    base_curve,
+                    leg_index,
+                    sample_spacing=settings.sample_spacing,
+                ))
+
+        for curve in curve_candidates:
+            try:
+                trajectory = time_parameterize(curve, waypoints, limits, signature)
+            except ValueError:
+                continue
+            clearance = _minimum_center_clearance(curve.positions, obstacles)
+            trajectory = PlannedTrajectory(
+                samples=trajectory.samples,
+                waypoint_distances=trajectory.waypoint_distances,
+                estimated_time=trajectory.estimated_time,
+                length=trajectory.length,
+                minimum_clearance=clearance,
+                mission_signature=trajectory.mission_signature,
+            )
+            feasible.append((trajectory.estimated_time, topology, trajectory))
 
     if not feasible:
         raise PlanningError(
