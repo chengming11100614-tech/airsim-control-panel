@@ -271,6 +271,19 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("航点", result.warning)
         self.assertEqual(controller._next_waypoint, 1)
         self.assertGreater(result.vx, 0.0)
+        self.assertEqual(len(result.waypoint_passages), 1)
+        self.assertEqual(result.waypoint_passages[0][0], 0)
+        self.assertAlmostEqual(result.waypoint_passages[0][1], 0.4)
+
+    def test_controller_prediction_period_adapts_to_telemetry_interval(self):
+        controller = PredictivePathController(
+            self.straight_trajectory(), _limits(speed=2.0)
+        )
+        for _ in range(8):
+            controller.update_period(0.0625)
+
+        self.assertGreater(controller.dt, 0.060)
+        self.assertAlmostEqual(controller.dt, controller._solver_period, delta=0.004)
 
     def test_vertical_segment_uses_three_dimensional_progress(self):
         limits = _limits(speed=2.0)
