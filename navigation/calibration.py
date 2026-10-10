@@ -1,6 +1,7 @@
 """从安全直线的分级飞行记录中估计巡航参数。"""
 
 from dataclasses import dataclass
+from bisect import bisect_right
 import math
 from statistics import median
 from typing import Sequence, Tuple
@@ -103,11 +104,11 @@ def analyze_calibration(
             braking_values.append((first.along_speed - second.along_speed) / dt)
     braking = min(5.0, max(0.5, median(braking_values))) if braking_values else 1.0
 
+    velocity_time_constant, velocity_acceleration, command_delay = _fit_velocity_response(samples)
     responses = [trial.response_time for trial in qualified if math.isfinite(trial.response_time)]
-    command_delay = 0.10  # 20 Hz 指令周期折算为最多两个采样周期。
     response_time = max(0.05, median(responses) - command_delay) if responses else 0.25
     worst_error = max((trial.cross_track_p95 for trial in qualified), default=0.0)
-    velocity_time_constant, velocity_acceleration = _fit_velocity_response(samples)
+    control_period = _fit_control_period(samples)
     profile = CalibrationProfile(
         calibrated=calibrated,
         safe_max_speed=min(15.0, safe_max_speed),
@@ -120,12 +121,13 @@ def analyze_calibration(
         tested_speeds=tuple(trial.speed for trial in trials),
         velocity_time_constant=velocity_time_constant,
         velocity_acceleration=velocity_acceleration,
+        control_period=control_period,
     )
     return CalibrationResult(profile, tuple(trials))
 
 
 def _fit_velocity_response(samples):
-    """用分级速度和制动样本拟合一阶响应及可用的速度矢量加速度。
+    """用分级速度和制动样本拟合指令延迟、一阶响应和矢量加速度。
 
     这只是当前 AirSim 机体的低阶近似，用来预测候选路线的实飞时间和偏移；
     样本不足时保留最近一次实飞辨识出的默认值，不从极少数据猜参数。
@@ -133,30 +135,48 @@ def _fit_velocity_response(samples):
     rows = sorted(samples, key=lambda row: row.time)
     commands = {row.requested_speed for row in rows}
     if len(rows) < 12 or len(commands) < 3:
-        return 1.4, 1.25
+        return 1.3, 1.3, 0.05
 
+    times = [row.time for row in rows]
+    intervals = [(first, second, second.time - first.time)
+                 for first, second in zip(rows, rows[1:])
+                 if second.time - first.time > 1e-4]
     best_error = float("inf")
-    best = (1.4, 1.25)
-    # 网格足够细即可区分响应慢、加速度受限两种主要误差来源。
-    for tau_step in range(3, 31):
-        time_constant = tau_step * 0.1
-        for acceleration_step in range(5, 51):
-            acceleration = acceleration_step * 0.1
-            predicted = rows[0].along_speed
-            squared_error = 0.0
-            used = 0
-            for first, second in zip(rows, rows[1:]):
-                dt = second.time - first.time
-                if dt <= 1e-4:
-                    continue
-                target = 0.0 if first.phase == "braking" else first.requested_speed
-                change = (target - predicted) * (1.0 - math.exp(-dt / time_constant))
-                change = max(-acceleration * dt, min(acceleration * dt, change))
-                predicted += change
-                residual = predicted - second.along_speed
-                squared_error += residual * residual
-                used += 1
-            if used and squared_error < best_error:
-                best_error = squared_error
-                best = (time_constant, acceleration)
+    best = (1.3, 1.3, 0.05)
+    for delay_step in range(5):
+        command_delay = delay_step * 0.05
+        targets = []
+        for first, second, dt in intervals:
+            command_index = bisect_right(times, first.time - command_delay) - 1
+            if command_index < 0:
+                targets.append((first.along_speed, 0.0, second.along_speed, dt))
+            else:
+                command = rows[command_index]
+                target = 0.0 if command.phase == "braking" else command.requested_speed
+                targets.append((first.along_speed, target, second.along_speed, dt))
+        for tau_step in range(2, 31):
+            time_constant = tau_step * 0.1
+            response = [1.0 - math.exp(-dt / time_constant)
+                        for _current, _target, _actual, dt in targets]
+            for acceleration_step in range(5, 51):
+                acceleration = acceleration_step * 0.1
+                squared_error = 0.0
+                for (current, target, actual, dt), alpha in zip(targets, response):
+                    change = (target - current) * alpha
+                    change = max(-acceleration * dt, min(acceleration * dt, change))
+                    residual = current + change - actual
+                    squared_error += residual * residual
+                if squared_error < best_error:
+                    best_error = squared_error
+                    best = (time_constant, acceleration, command_delay)
     return best
+
+
+def _fit_control_period(samples):
+    """从标定采样间隔估计面板真实控制周期，剔除超时和停顿。"""
+    times = sorted(sample.time for sample in samples)
+    periods = [second - first for first, second in zip(times, times[1:])
+               if 0.025 <= second - first <= 0.15]
+    if not periods:
+        return 0.0625
+    return min(0.10, max(0.035, median(periods)))

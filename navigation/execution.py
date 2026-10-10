@@ -1,8 +1,9 @@
 """闭环预测 AirSim 飞行器对一条规划轨迹的实际跟踪结果。"""
 
 from collections import deque
+from bisect import bisect_right
 import math
-from typing import Sequence
+from typing import Optional, Sequence
 
 from .controller import CarrotPathController
 from .models import (
@@ -14,11 +15,15 @@ from .models import (
 )
 
 
+# 面板的到点接收半径；预测中远离该半径的路线不能称为已可行。
+PREDICTED_WAYPOINT_TOLERANCE = 0.6
+
+
 def predict_execution(
     trajectory: PlannedTrajectory,
     limits: KinematicLimits,
     obstacles: Sequence[CircleObstacle] = (),
-    dt: float = 0.05,
+    dt: Optional[float] = None,
 ) -> ExecutionPrediction:
     """用与自动巡航相同的控制器模拟飞机响应、净空和航点经过误差。
 
@@ -26,6 +31,7 @@ def predict_execution(
     因此这里用标定的指令延迟、一阶速度响应和矢量加速度上限推进飞机状态。
     该模拟用于比较候选路线，不会改变实际巡航时消费的引导曲线。
     """
+    dt = limits.control_period if dt is None else dt
     if not math.isfinite(dt) or dt <= 0.0:
         raise ValueError("预测步长必须大于 0")
     if not trajectory.samples:
@@ -50,7 +56,7 @@ def predict_execution(
             safe=complete and clearance >= required_clearance - 1e-6,
         )
 
-    controller = CarrotPathController(trajectory, limits, obstacles, dt=dt)
+    controller = CarrotPathController(trajectory, limits, obstacles, dt=0.05)
     first = trajectory.samples[0]
     position = (first.x, first.y, first.z)
     velocity = (0.0, 0.0)
@@ -70,6 +76,9 @@ def predict_execution(
     max_duration = max(30.0, trajectory.estimated_time * 2.5 + 10.0)
     max_steps = int(math.ceil(max_duration / dt))
     for _ in range(max_steps):
+        if elapsed > 0.0:
+            # 与运行面板相同，控制器按观测到的遥测周期逐步调整指令变化率。
+            controller.update_period(dt)
         result = controller.step(position, velocity, elapsed)
         for waypoint_index, error in result.waypoint_passages:
             errors[waypoint_index] = error
@@ -118,6 +127,7 @@ def predict_execution(
     safe = (
         complete
         and all(math.isfinite(error) for error in waypoint_errors)
+        and max(waypoint_errors, default=0.0) <= PREDICTED_WAYPOINT_TOLERANCE
         and minimum_clearance >= required_clearance - 1e-6
     )
     return ExecutionPrediction(
@@ -128,6 +138,32 @@ def predict_execution(
         complete=complete,
         safe=safe,
     )
+
+
+def sample_execution_at_time(prediction: ExecutionPrediction, when: float):
+    """按时间插值预测轨迹，供飞行日志逐拍对齐实际位置。"""
+    samples = prediction.samples
+    if not samples:
+        return None
+    if when <= samples[0].time:
+        return samples[0]
+    if when >= samples[-1].time:
+        return samples[-1]
+    times = [sample.time for sample in samples]
+    right = bisect_right(times, when)
+    first, second = samples[right - 1], samples[right]
+    span = second.time - first.time
+    fraction = (when - first.time) / span if span > 1e-12 else 0.0
+    fields = (
+        "time", "distance", "x", "y", "z", "vx", "vy", "vz",
+        "ax", "ay", "az", "curvature",
+    )
+    values = {
+        name: getattr(first, name) + fraction * (getattr(second, name) - getattr(first, name))
+        for name in fields
+    }
+    values["waypoint_index"] = first.waypoint_index
+    return TrajectorySample(**values)
 
 
 def _advance_velocity(current, target, dt, time_constant, acceleration):

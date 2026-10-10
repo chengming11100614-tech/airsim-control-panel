@@ -11,11 +11,13 @@ from navigation.calibration import (
 )
 from navigation.controller import CarrotPathController
 from navigation.curve import fit_safe_curve
-from navigation.execution import predict_execution
+from navigation.demo import demo_obstacles, demo_waypoints
+from navigation.execution import predict_execution, sample_execution_at_time
 from navigation.geometry import inflate_obstacles, plan_leg_candidates
 from navigation.models import (
     CircleObstacle,
     CalibrationProfile,
+    ExecutionPrediction,
     KinematicLimits,
     PlannedTrajectory,
     TrajectorySample,
@@ -54,6 +56,30 @@ def _assert_waypoint_order(test, trajectory, waypoints):
 
 
 class RoutePlanningTests(unittest.TestCase):
+    def test_execution_prediction_interpolates_position_at_telemetry_time(self):
+        samples = (
+            TrajectorySample(
+                time=0.0, distance=0.0, x=0.0, y=1.0, z=-5.0,
+                vx=0.0, vy=0.0, vz=0.0, ax=0.0, ay=0.0, az=0.0,
+                curvature=0.0,
+            ),
+            TrajectorySample(
+                time=2.0, distance=10.0, x=10.0, y=5.0, z=-3.0,
+                vx=10.0, vy=4.0, vz=2.0, ax=0.0, ay=0.0, az=0.0,
+                curvature=0.2,
+            ),
+        )
+        prediction = ExecutionPrediction(
+            samples=samples, estimated_time=2.0, minimum_clearance=1.0,
+            waypoint_errors=(), complete=True, safe=True,
+        )
+
+        middle = sample_execution_at_time(prediction, 1.0)
+
+        self.assertEqual(middle.position, (5.0, 3.0, -4.0))
+        self.assertEqual(middle.distance, 5.0)
+        self.assertEqual((middle.vx, middle.vy, middle.vz), (5.0, 2.0, 1.0))
+
     def test_saved_routes_keep_legacy_waypoints_but_ignore_per_point_speed(self):
         waypoint = Waypoint.from_dict({
             "x": 1, "y": 2, "z": -5, "speed": 0.5, "hold": 1.25,
@@ -98,6 +124,21 @@ class RoutePlanningTests(unittest.TestCase):
             plan_ordered_route(
                 (0, 0, -5), [Waypoint(5, 0, -5)], [CircleObstacle(5, 0, 1)], _limits()
             )
+
+    def test_closed_route_keeps_last_waypoint_at_the_end_not_at_start(self):
+        waypoints = demo_waypoints()
+        trajectory = plan_ordered_route(
+            (0, 0, -5), waypoints, demo_obstacles(), KinematicLimits()
+        )
+
+        prediction = trajectory.execution_prediction
+        self.assertAlmostEqual(
+            trajectory.waypoint_distances[-1], trajectory.length, places=3
+        )
+        self.assertTrue(prediction.safe)
+        self.assertLessEqual(prediction.waypoint_errors[-1], 0.6)
+        self.assertLess(math.dist(prediction.samples[-1].position,
+                                  waypoints[-1].position), 0.6)
 
     def test_height_and_hold_are_included_and_speed_changes_estimated_time(self):
         waypoints = [Waypoint(5, 0, -10, hold=0.7), Waypoint(10, 5, -5)]
@@ -186,6 +227,13 @@ class RoutePlanningTests(unittest.TestCase):
                                 limits.safety_clearance + limits.tracking_reserve)
         self.assertTrue(selected.execution_prediction.safe)
         self.assertGreater(selected.length, shortest[0] + 0.5)
+        prediction = selected.execution_prediction
+        self.assertAlmostEqual(
+            prediction.samples[1].time - prediction.samples[0].time,
+            limits.control_period,
+        )
+        midpoint = sample_execution_at_time(prediction, prediction.estimated_time * 0.5)
+        self.assertAlmostEqual(midpoint.time, prediction.estimated_time * 0.5)
 
     def test_uncalibrated_panel_keeps_user_speed_cap_for_time_planning(self):
         limits = GCSApp._limits_for_planning(
@@ -194,6 +242,10 @@ class RoutePlanningTests(unittest.TestCase):
         self.assertEqual(limits.max_speed, 15.0)
         self.assertEqual(limits.max_acceleration, 0.65)
         self.assertEqual(limits.max_braking, 0.55)
+        self.assertEqual(limits.command_delay, 0.05)
+        self.assertEqual(limits.velocity_time_constant, 1.3)
+        self.assertEqual(limits.velocity_acceleration, 1.3)
+        self.assertEqual(limits.control_period, 0.0625)
 
         calibrated = GCSApp._limits_for_planning(
             15.0, 0.8,
@@ -578,6 +630,8 @@ class CalibrationTests(unittest.TestCase):
 
         self.assertAlmostEqual(profile.velocity_time_constant, time_constant, delta=0.15)
         self.assertAlmostEqual(profile.velocity_acceleration, acceleration, delta=0.15)
+        self.assertAlmostEqual(profile.command_delay, 0.0, delta=1e-9)
+        self.assertAlmostEqual(profile.control_period, 0.05, delta=1e-9)
 
 
 if __name__ == "__main__":

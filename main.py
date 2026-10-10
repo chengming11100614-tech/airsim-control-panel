@@ -36,6 +36,7 @@ from navigation.telemetry import deviation_to_path
 from navigation.calibration import (SPEED_STEPS, CalibrationSample,
                                     analyze_calibration)
 from navigation.controller import CarrotPathController
+from navigation.execution import sample_execution_at_time
 from navigation.geometry import InflatedCircle, segment_clear
 from navigation.models import CalibrationProfile, CircleObstacle, KinematicLimits, Waypoint
 from navigation.planner import PlanningError, plan_ordered_route
@@ -125,6 +126,8 @@ class FlightRecorder:
               "cmd_vx", "cmd_vy", "ref_x", "ref_y", "ref_z",
               "ref_distance", "ref_curvature", "planned_speed",
               "controller_dt", "controller_mode",
+              "pred_x", "pred_y", "pred_z", "pred_time",
+              "pred_distance", "pred_speed", "prediction_error",
               "passage_wp", "passage_error"]
 
     def __init__(self, out_dir=None):
@@ -284,7 +287,10 @@ class GCSApp:
         self._cruise_deviations = []
         self._straight_deviations = []
         self._curve_deviations = []
+        self._cruise_prediction_errors = []
         self._control_debug = {}
+        self._cruise_prediction = None
+        self._cruise_start_monotonic = 0.0
         self._minimum_cruise_clearance = float("inf")
         self._cruise_elapsed = 0.0
         self.recorder = None
@@ -764,6 +770,34 @@ class GCSApp:
 
         with self._lock:
             row.update(self._control_debug)
+            predicted_sample = None
+            if self._cruise_prediction is not None:
+                prediction_elapsed = max(
+                    0.0, row["monotonic"] - self._cruise_start_monotonic
+                )
+                predicted_sample = sample_execution_at_time(
+                    self._cruise_prediction, prediction_elapsed
+                )
+            if predicted_sample is not None:
+                row.update({
+                    "pred_x": round(predicted_sample.x, 4),
+                    "pred_y": round(predicted_sample.y, 4),
+                    "pred_z": round(predicted_sample.z, 4),
+                    "pred_time": round(predicted_sample.time, 4),
+                    "pred_distance": round(predicted_sample.distance, 4),
+                    "pred_speed": round(math.sqrt(
+                        predicted_sample.vx ** 2 + predicted_sample.vy ** 2
+                        + predicted_sample.vz ** 2
+                    ), 4),
+                })
+                prediction_error = math.dist(
+                    (x, y, z),
+                    (predicted_sample.x, predicted_sample.y, predicted_sample.z),
+                )
+                row["prediction_error"] = round(prediction_error, 3)
+            else:
+                prediction_error = None
+                row["prediction_error"] = ""
             self.telem = row
             self.trail.append((x, y, z))
             if len(self.trail) > 4000:   # 只留最近的一段，画布才画得动
@@ -771,6 +805,8 @@ class GCSApp:
 
         if self._cruise_active:
             self._cruise_deviations.append(dev["dist"])
+            if prediction_error is not None:
+                self._cruise_prediction_errors.append(prediction_error)
             curvature = abs(row.get("ref_curvature", 0.0))
             if curvature <= 0.02:  # 曲率单位为 1/m；小于此值视为直线段
                 self._straight_deviations.append(dev["dist"])
@@ -1147,6 +1183,7 @@ class GCSApp:
             tracking_reserve=max(0.25, profile.cross_track_p95),
             velocity_time_constant=profile.velocity_time_constant,
             velocity_acceleration=profile.velocity_acceleration,
+            control_period=profile.control_period,
         )
 
     def _job_plan(self, limits, alt, waypoints, obstacles, revision):
@@ -1431,12 +1468,15 @@ class GCSApp:
         self._log(
             "标定完成：安全上限 %.1f m/s，沿线偏差 P95 %.3f m；"
             "加速度 %.2f、制动 %.2f m/s²，响应 %.2f s；"
-            "速度模型 τ %.2f s / 矢量加速度 %.2f m/s²。"
+            "速度模型 τ %.2f s / 矢量加速度 %.2f m/s²，"
+            "指令延迟 %.2f s、控制周期 %.3f s。"
             % (result.profile.safe_max_speed, result.profile.cross_track_p95,
                result.profile.acceleration, result.profile.braking,
                result.profile.response_time,
                result.profile.velocity_time_constant,
-               result.profile.velocity_acceleration), "ok")
+               result.profile.velocity_acceleration,
+               result.profile.command_delay,
+               result.profile.control_period), "ok")
         if passed < 15.0:
             self._log("15 m/s 未达到精度/速度条件，后续规划采用已通过的 %.1f m/s。"
                       % passed, "warn")
@@ -1529,6 +1569,9 @@ class GCSApp:
         self._cruise_deviations = []
         self._straight_deviations = []
         self._curve_deviations = []
+        self._cruise_prediction_errors = []
+        self._cruise_prediction = None
+        self._cruise_start_monotonic = 0.0
         self._minimum_cruise_clearance = float("inf")
         self._cruise_elapsed = 0.0
         self._cruise_active = True
@@ -1543,6 +1586,9 @@ class GCSApp:
                           % math.dist(actual_start, planned_start), "err")
                 return
 
+            with self._lock:
+                self._cruise_prediction = trajectory.execution_prediction
+                self._cruise_start_monotonic = time.monotonic()
             controller = CarrotPathController(trajectory, limits, obstacles)
             self._log("开始沿平滑轨迹巡航：预计 T %.1f 秒，速度上限 %.1f m/s。"
                       % (trajectory.estimated_time, limits.max_speed), "hi")
@@ -1682,6 +1728,7 @@ class GCSApp:
             self.cruise_index = -1
             with self._lock:
                 self._control_debug = {}
+                self._cruise_prediction = None
             self._set_mode("已连接")
 
         if completed:
@@ -1700,6 +1747,11 @@ class GCSApp:
             )
             minimum = self._minimum_cruise_clearance
             clearance_text = "%.2f m" % minimum if math.isfinite(minimum) else "无障碍物"
+            prediction_errors = sorted(self._cruise_prediction_errors)
+            prediction_p95 = (
+                prediction_errors[max(0, math.ceil(0.95 * len(prediction_errors)) - 1)]
+                if prediction_errors else 0.0
+            )
             failed_waypoints = [
                 index + 1 for index, error in self._waypoint_passage_errors.items()
                 if error > 0.25
@@ -1714,9 +1766,10 @@ class GCSApp:
             self._log(
                 "巡航完成：实际 T %.1f s；航点最大误差 %.3f m；"
                 "全程/直线/弯道横向偏差 P95 %.3f/%.3f/%.3f m；"
+                "同一时刻预测位置误差 P95 %.3f m；"
                 "最低障碍边缘净空 %s；直线摆动 %d 次；%s。"
                 % (elapsed, self._max_waypoint_error, p95, straight_p95, curve_p95,
-                   clearance_text, self._sway_count, accuracy),
+                   prediction_p95, clearance_text, self._sway_count, accuracy),
                 "ok" if accuracy == "航点精度达标" and straight_p95 <= 0.25 else "warn")
         elif self.stop_evt.is_set():
             self._log("巡航已停止，飞机悬停。", "warn")

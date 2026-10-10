@@ -53,6 +53,7 @@ def plan_ordered_route(
         limits.max_braking, limits.max_lateral_acceleration, limits.response_time,
         limits.command_delay, limits.safety_clearance, limits.tracking_reserve,
         limits.velocity_time_constant, limits.velocity_acceleration,
+        limits.control_period,
     )
     if not all(math.isfinite(value) for value in numeric_limits):
         raise PlanningError("飞行约束必须是有限数值")
@@ -62,7 +63,8 @@ def plan_ordered_route(
         raise PlanningError("最高速度必须大于 0 m/s")
     if min(limits.max_vertical_speed, limits.max_acceleration,
            limits.max_braking, limits.max_lateral_acceleration,
-           limits.velocity_time_constant, limits.velocity_acceleration) <= 0.0:
+           limits.velocity_time_constant, limits.velocity_acceleration,
+           limits.control_period) <= 0.0:
         raise PlanningError("速度、加速度、制动、横向能力和机体响应参数必须大于 0")
     if (limits.safety_clearance < 0.0 or limits.tracking_reserve < 0.0
             or limits.response_time < 0.0 or limits.command_delay < 0.0):
@@ -286,6 +288,7 @@ def _mission_signature(start, waypoints, obstacles, limits, settings):
             limits.response_time, limits.command_delay,
             limits.safety_clearance, limits.tracking_reserve,
             limits.velocity_time_constant, limits.velocity_acceleration,
+            limits.control_period,
         )],
         "settings": [settings.max_candidates_per_leg, settings.beam_width,
                      round(settings.curve_margin, 5), round(settings.sample_spacing, 5)],

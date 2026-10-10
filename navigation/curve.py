@@ -43,9 +43,12 @@ def fit_safe_curve(
     if not points:
         raise ValueError("规划路线没有位置点")
 
-    # 原始点可能在航点处重复；只做索引映射，不改变航点的精确坐标约束。
-    anchor_points = [route_points[index] for index in waypoint_anchor_indices]
-    anchor_params = [_point_parameter(points, target) for target in anchor_points]
+    # 用原始点索引映射航点参数，不能按坐标寻找：闭合路线的首末点可能重合，
+    # 按坐标取最近结点会把最后航点错误地映射回起点里程。
+    if any(index < 0 or index >= len(route_points) for index in waypoint_anchor_indices):
+        raise ValueError("航点锚点索引超出路线范围")
+    original_parameters = _cumulative_distance(route_points)
+    anchor_params = [original_parameters[index] for index in waypoint_anchor_indices]
 
     if len(points) == 1:
         position = points[0]
@@ -300,12 +303,3 @@ def _cumulative_distance(points):
     for first, second in zip(points, points[1:]):
         result.append(result[-1] + math.dist(first, second))
     return result
-
-
-def _point_parameter(points, target):
-    """取曲线锚点处的累计距离；路线构造时保证航点坐标是结点。"""
-    cumulative = _cumulative_distance(points)
-    closest = min(range(len(points)), key=lambda index: math.dist(points[index], target))
-    if math.dist(points[closest], target) > 1e-5:
-        raise ValueError("曲线路线中缺少精确航点坐标")
-    return cumulative[closest]

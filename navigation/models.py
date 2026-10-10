@@ -94,12 +94,14 @@ class CalibrationProfile:
     braking: float = 0.55
     lateral_acceleration: float = 1.0
     response_time: float = 0.25
-    command_delay: float = 0.10
+    command_delay: float = 0.05
     cross_track_p95: float = 0.0
     tested_speeds: Tuple[float, ...] = ()
     # 速度指令到实际速度的响应模型。它与规划速度曲线的加速度上限不同。
-    velocity_time_constant: float = 1.4
-    velocity_acceleration: float = 1.25
+    velocity_time_constant: float = 1.3
+    velocity_acceleration: float = 1.3
+    # 实飞日志中 AirSim 遥测与控制循环的中位周期约为 62.5 ms。
+    control_period: float = 0.0625
 
 
 @dataclass(frozen=True)
@@ -112,12 +114,13 @@ class KinematicLimits:
     max_braking: float = 0.55
     max_lateral_acceleration: float = 1.0
     response_time: float = 0.25
-    command_delay: float = 0.10
+    command_delay: float = 0.05
     safety_clearance: float = 0.8
     tracking_reserve: float = 0.25
     # AirSim 实测速度响应：一阶时间常数和速度矢量最大变化率。
-    velocity_time_constant: float = 1.4
-    velocity_acceleration: float = 1.25
+    velocity_time_constant: float = 1.3
+    velocity_acceleration: float = 1.3
+    control_period: float = 0.0625
 
 
 @dataclass(frozen=True)
