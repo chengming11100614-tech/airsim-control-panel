@@ -192,6 +192,21 @@ class ControllerTests(unittest.TestCase):
         ).step((0, 0, -5), (0, 0, 0), 0.0)
         self.assertIn("障碍物", blocked.fault)
 
+        # 0.8 m 是规划时的绕障余量；进入这段余量仍可继续沿路线飞行。
+        buffered = PredictivePathController(
+            route, limits, [CircleObstacle(5, 1.79, 1.0)]
+        ).check_state((5, 0, -5))
+        self.assertEqual(buffered[2], "")
+        self.assertAlmostEqual(buffered[1], 0.0)
+        edge_clearance = math.hypot(5 - 5, 0 - 1.79) - 1.0
+        self.assertAlmostEqual(edge_clearance, 0.79)
+
+        # 接近手绘障碍物实体边缘时，仍保留小的硬保护间距。
+        near_edge = PredictivePathController(
+            route, limits, [CircleObstacle(5, 1.05, 1.0)]
+        ).check_state((5, 0, -5))
+        self.assertIn("障碍物", near_edge[2])
+
         skipped = PredictivePathController(
             self.straight_trajectory((5.0, 10.0)), limits
         ).step((10, 0, -5), (0, 0, 0), 0.0)

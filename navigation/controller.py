@@ -11,6 +11,11 @@ from scipy import sparse
 from .models import KinematicLimits, PlannedTrajectory
 
 
+# 规划用的膨胀半径包含较大的跟踪余量；巡航时允许飞机进入这段余量，
+# 只在接近手绘障碍物的实际边界时触发硬停止。单位为米，量到飞机中心。
+HARD_OBSTACLE_CLEARANCE = 0.10
+
+
 @dataclass(frozen=True)
 class ControlResult:
     """单次控制结果；fault 非空时调用方必须悬停并停止自动巡航。"""
@@ -56,15 +61,18 @@ class PredictivePathController:
         self._solver, self._control_matrix = self._build_solver()
 
     def check_state(self, position):
-        """验证当前状态仍在规划走廊中，并且距障碍物留有约定净空。"""
+        """检查偏航和实际障碍边界；规划膨胀余量不是碰撞边界。"""
         x, y, z = (float(value) for value in position)
         clearance = min(
             (math.hypot(x - obstacle.x, y - obstacle.y) - obstacle.radius
              for obstacle in self.obstacles),
             default=float("inf"),
         )
-        if clearance < self.limits.safety_clearance:
-            return 0.0, clearance, "当前位置已进入障碍物安全间距"
+        if clearance < HARD_OBSTACLE_CLEARANCE:
+            return 0.0, clearance, (
+                "距障碍物实际边缘仅 %.2f m，低于 %.2f m 硬保护间距"
+                % (clearance, HARD_OBSTACLE_CLEARANCE)
+            )
 
         previous_progress = self._progress_distance
         distance, deviation, expected_z = self._project_progress(x, y)
