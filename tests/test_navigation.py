@@ -184,6 +184,37 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(finished)
         self.assertLess(maximum_deviation, 0.25)
 
+    def test_predictive_controller_finishes_when_tracking_enters_planning_buffer(self):
+        limits = _limits(speed=5.0)
+        obstacle = CircleObstacle(5.0, 1.79, 1.0)
+        controller = PredictivePathController(
+            self.straight_trajectory(), limits, [obstacle]
+        )
+        position, velocity = [0.0, 0.0, -5.0], [0.0, 0.0]
+        minimum_clearance = float("inf")
+        finished = False
+        for index in range(240):
+            result = controller.step(position, velocity, index * 0.05)
+            self.assertFalse(result.fault)
+            minimum_clearance = min(
+                minimum_clearance,
+                math.hypot(position[0] - obstacle.x, position[1] - obstacle.y)
+                - obstacle.radius,
+            )
+            alpha = math.exp(-0.05 / 0.35)
+            velocity = [alpha * current + (1.0 - alpha) * command
+                        for current, command in zip(velocity, (result.vx, result.vy))]
+            position[0] += velocity[0] * 0.05
+            position[1] += velocity[1] * 0.05
+            position[2] = result.z
+            if result.finished:
+                finished = True
+                break
+
+        self.assertTrue(finished)
+        self.assertLess(minimum_clearance, limits.safety_clearance)
+        self.assertGreaterEqual(minimum_clearance, 0.10)
+
     def test_controller_hovers_on_obstacle_clearance_or_waypoint_miss(self):
         limits = _limits(speed=5.0)
         route = self.straight_trajectory()
