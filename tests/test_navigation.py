@@ -275,6 +275,20 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(result.waypoint_passages[0][0], 0)
         self.assertAlmostEqual(result.waypoint_passages[0][1], 0.4)
 
+    def test_final_waypoint_is_logged_when_stopping_inside_accuracy_radius(self):
+        controller = PredictivePathController(
+            self.straight_trajectory(), _limits(speed=2.0)
+        )
+        controller._progress_distance = 9.8
+        controller._previous_position = (9.8, 0.0, -5.0)
+
+        result = controller.step((9.9, 0.0, -5.0), (0.2, 0.0), elapsed=10.0)
+
+        self.assertTrue(result.finished)
+        self.assertEqual(len(result.waypoint_passages), 1)
+        self.assertEqual(result.waypoint_passages[0][0], 0)
+        self.assertAlmostEqual(result.waypoint_passages[0][1], 0.1)
+
     def test_controller_prediction_period_adapts_to_telemetry_interval(self):
         controller = PredictivePathController(
             self.straight_trajectory(), _limits(speed=2.0)

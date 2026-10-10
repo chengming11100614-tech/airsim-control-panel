@@ -178,6 +178,13 @@ class PredictivePathController:
             and abs(float(position[2]) - final.z) <= 0.25
             and math.hypot(vx, vy) <= 0.35
         )
+        # 终点允许在 0.25 m 内停车，投影可能尚未越过最后一个弧长采样。
+        # 记录最终实测位置，避免完成报告把最后一航点标成漏点。
+        if finished and self._next_waypoint == len(self.trajectory.waypoint_distances) - 1:
+            target = self._sample_at_distance(self.trajectory.waypoint_distances[-1])
+            final_error = math.hypot(x - target.x, y - target.y)
+            self._last_waypoint_passages += ((self._next_waypoint, final_error),)
+            self._next_waypoint += 1
         reference = references[0]
         return ControlResult(
             float(command[0]), float(command[1]), reference.z,
@@ -209,7 +216,8 @@ class PredictivePathController:
                 fraction = 1.0
             crossing = tuple(a + fraction * (b - a)
                              for a, b in zip(previous, position))
-            error = math.dist(crossing, target)
+            # 验收指标按水平航点误差统计；高度由独立的 Z 轴跟踪约束处理。
+            error = math.hypot(crossing[0] - target[0], crossing[1] - target[1])
             if error > 0.25:
                 warnings.append(
                     "第 %d 个航点经过误差 %.2f m；不回头，继续前飞并回归后续航线"
