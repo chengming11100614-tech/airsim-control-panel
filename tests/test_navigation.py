@@ -282,7 +282,7 @@ class RoutePlanningTests(unittest.TestCase):
             15.0, 0.8, CalibrationProfile(calibrated=False, safe_max_speed=2.0)
         )
         self.assertEqual(limits.max_speed, 15.0)
-        self.assertEqual(limits.max_acceleration, 0.65)
+        self.assertEqual(limits.max_acceleration, 1.2)
         self.assertEqual(limits.max_braking, 0.55)
         self.assertEqual(limits.command_delay, 0.05)
         self.assertEqual(limits.velocity_time_constant, 1.3)

@@ -1169,7 +1169,7 @@ class GCSApp:
 
     @staticmethod
     def _limits_for_planning(requested_speed, clearance, profile):
-        """未标定时仍允许竞速上限，但用保守动力学能力生成逐点速度曲线。"""
+        """未标定时允许竞速上限，并按当前实飞验证的动力学生成逐点速度曲线。"""
         available_speed = profile.safe_max_speed if profile.calibrated else 15.0
         return KinematicLimits(
             max_speed=min(15.0, requested_speed, available_speed),

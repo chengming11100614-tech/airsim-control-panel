@@ -88,9 +88,9 @@ class CalibrationProfile:
 
     calibrated: bool = False
     safe_max_speed: float = 2.0
-    # 本轮 AirSim 实飞的有效加速度/制动中位数约为 0.48/0.54 m/s²；
-    # 未完成独立标定前用略偏保守的模型安排提速和弯前制动。
-    acceleration: float = 0.65
+    # 六航点任务实飞验证了这组规划加减速上限：更早开始弯前制动，任务用时更短。
+    # 它们只生成路线速度曲线；AirSim 速度响应仍由下方实测响应模型限制。
+    acceleration: float = 1.2
     braking: float = 0.55
     lateral_acceleration: float = 1.0
     response_time: float = 0.25
@@ -110,7 +110,7 @@ class KinematicLimits:
 
     max_speed: float = 15.0
     max_vertical_speed: float = 2.0
-    max_acceleration: float = 0.65
+    max_acceleration: float = 1.2
     max_braking: float = 0.55
     max_lateral_acceleration: float = 1.0
     response_time: float = 0.25
