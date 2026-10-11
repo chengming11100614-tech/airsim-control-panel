@@ -50,4 +50,6 @@ Start the AirSim scene first, then connect from the panel. The simulator runs on
 python -m unittest discover -s tests -v
 ```
 
+Curated flight experiment logs and the iteration summary are available in [experiments/README.md](experiments/README.md). The archive keeps flight segments while leaving idle telemetry and local simulator files out of Git.
+
 Flight logs, local simulator settings, and Python environments are excluded from Git.
