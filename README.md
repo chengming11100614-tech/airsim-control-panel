@@ -50,6 +50,10 @@ Start the AirSim scene first, then connect from the panel. The simulator runs on
 python -m unittest discover -s tests -v
 ```
 
-Curated flight experiment logs and the iteration summary are available in [experiments/README.md](experiments/README.md). The archive keeps flight segments while leaving idle telemetry and local simulator files out of Git.
+## 参数优化记录
+
+参数对比应固定起点、航点顺序、障碍物地图和速度上限；每个候选至少重复试飞三次，并结合平均用时、航点误差和最小障碍净空评估效果。
+
+已整理的实飞日志和参数迭代汇总见 [experiments/README.md](experiments/README.md)。归档仅保留飞行区间，空闲遥测和本地模拟器文件不纳入 Git。
 
 Flight logs, local simulator settings, and Python environments are excluded from Git.
